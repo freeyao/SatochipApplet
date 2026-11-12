@@ -169,7 +169,9 @@ public class Sha256 {
         block[fill] = (byte) 0x80;
         fill++;
         if (fill > (short) 56) {
-            Util.arrayFillNonAtomic(block, fill, (short) (BLOCKSIZE - fill), (byte) 0);
+            // fill can be 64 here: a zero-length fill at offset 64 is an error on some cards
+            if (fill < BLOCKSIZE)
+                Util.arrayFillNonAtomic(block, fill, (short) (BLOCKSIZE - fill), (byte) 0);
             compress();
             fill = (short) 0;
         }

@@ -29,6 +29,8 @@ SignTransactionHash no longer uses the card's black-box ECDSA, and the three sig
 
 * **getBIP32ExtendedKey (0x6D), getPublicKeyFromPrivate (0x35), InitiateSecureChannel (0x81):** the card returns the full uncompressed public key instead of an x coordinate and a self-signature. Clients must parse the new formats; see *Removed* for the byte layouts and what to change.
 * **Installation** is refused with `SW_UNSUPPORTED_FEATURE` (0x9C05) on a card without the RSA squaring, the RSA exponentiation used for modular inversion, or `ALG_EC_PACE_GM`. Such a card could not sign.
+* **Installation** also fails on a card that cannot provide the working buffers in RAM (about 1 KB of transient memory, cleared on deselect or else on reset). They used to fall back to persistent memory, which would write private keys and nonces to EEPROM.
+* **Clients must check that the public key returned by getPublicKeyFromPrivate (0x35) is a point of the curve** (y^2 = x^3 + 7) before using it. That response no longer carries a self-signature, and the secure channel encrypts responses without authenticating them: a ciphertext altered in transit decrypts to bytes that are a point of the curve only with negligible probability. The on-curve check replaces what the public key recovery was doing implicitly. (The other two responses are covered by the authentikey signature.)
 
 ### New features
 
@@ -36,10 +38,18 @@ SignTransactionHash no longer uses the card's black-box ECDSA, and the three sig
   * the nonce is the RFC 6979 nonce (HMAC-SHA256 of the private key and the hash, no extra entropy); r is ground to low-r (the derivation is restarted with a counter while r >= 2^255) and s is normalized to low-S;
   * the signature is deterministic and is the one libsecp256k1 / Bitcoin Core produce, so a card can be cross-checked against another signer holding the same key. The card's random generator does not enter the signature;
   * the signature is verified on the card (u1\*G + u2\*P) before it is returned. If it does not verify, `0x9C4D` is returned and nothing is output;
-  * the platform engines never receive the nonce or the private key: R = k\*G is computed as (k\*w^-1)\*(w\*G) for a random w, k^-1 is obtained from the inverse of k\*b for a random b, and the multiplications use operands blinded with a random multiple of n.
+  * the signature is protected against a fault in RAM: h, k and s are each held twice, with one copy feeding the signature and the other its check, the verdict of the check is tested twice, and the r that is output is the one the check recomputed;
+  * what the platform still sees. The platform is **not** kept from knowing the nonce and the private key. R = k\*G is computed as (k\*w^-1)\*(w\*G) for a random w, and k^-1 is obtained from the inverse of k\*b for a random b, so the EC engine and the inversion engine get masked values. The multiplications run on the RSA squaring engine with the secret operand x replaced by x + m\*n for a random m: this randomizes the bits processed (a protection against partial leakage such as power analysis) but the value is still congruent to x, so that engine is given k, d and h + r\*d up to a reduction modulo n, as well as the masks b and w^-1. The key object holds d, and the random masks come from the platform. What the construction does guarantee: the nonce is derived by the applet, the correct signature is unique, and any deviation shows up when the signature is compared byte for byte with another BIP461 signer;
   * Command and response format are unchanged (DER). Signatures are at most 70 bytes; the client-side low-S normalization is no longer needed. New status words: `0x9C4D` (the signature did not verify) and `0x9C4E` (no acceptable nonce within 64 grinding attempts, probability 2^-64).
   * A signature now takes several RSA and EC operations instead of one, and the time varies with the number of grinding attempts. Timings on a card: to be measured (`./gradlew benchmarkCard`).
 * **SHA-256 backend selected at install** for the nonce derivation: the platform MessageDigest (default) or an implementation in JavaCard bytecode, with which the private key and the nonce do not enter a platform primitive at all. Select the bytecode backend with install data `01` (`gp --install applet.cap --params 01`, or `./gradlew install -Porg.satochip.install.params=01`). The signatures are the same with both.
+
+### Security
+
+* The scratch EC key is overwritten with the scalar 1 after use on cards where it is a persistent object (no transient EC private keys, e.g. JCOP3 P60): the last nonce share or key it was loaded with no longer stays in EEPROM.
+* The intermediate secrets of the signature (masked inverse, h + r\*d, s before the check) are kept in an array of the applet instead of the APDU buffer.
+* The inversion engine is checked at install with a second known answer on a full-size input, and a result returned without its leading zero bytes is right-aligned.
+* `randomScalar()` stops with `0x9C4E` after 4 rejected draws instead of looping on a stuck random generator; the bytecode SHA-256 no longer issues a zero-length fill at the end of its block buffer.
 
 ### Removed
 

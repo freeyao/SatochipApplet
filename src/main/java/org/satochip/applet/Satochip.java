@@ -574,22 +574,13 @@ public class Satochip extends javacard.framework.Applet {
         // Before setup, the PIN is null and operations requiring it are handled accordingly.
         pin = null;
         
-        // Temporary working arrays
-        try {
-            tmpBuffer = JCSystem.makeTransientByteArray(TMP_BUFFER_SIZE, JCSystem.CLEAR_ON_DESELECT);
-        } catch (SystemException e) {
-            tmpBuffer = new byte[TMP_BUFFER_SIZE];
-        }
-        // Initialize the extended APDU buffer
-        try {
-            // Try to allocate the extended APDU buffer on RAM memory
-            recvBuffer = JCSystem.makeTransientByteArray(EXT_APDU_BUFFER_SIZE, JCSystem.CLEAR_ON_DESELECT);
-        } catch (SystemException e) {
-            // Allocate the extended APDU buffer on EEPROM memory
-            // This is the fallback method, but its usage is really not
-            // recommended as after ~ 100000 writes it will kill the EEPROM cells...
-            recvBuffer = new byte[EXT_APDU_BUFFER_SIZE];
-        }
+        // Temporary working arrays. They hold private keys and nonces while signing, so they
+        // must be RAM: CLEAR_ON_DESELECT, else CLEAR_ON_RESET, else the installation fails
+        // (makeTransientArray() throws). There is no fallback to persistent memory anymore: it
+        // would write those secrets to EEPROM, where they survive a power cut.
+        tmpBuffer = makeTransientArray(TMP_BUFFER_SIZE);
+        recvBuffer = makeTransientArray(EXT_APDU_BUFFER_SIZE);
+        ecdsaRam = makeTransientArray(ECDSA_RAM_SIZE);
         
         // common cryptographic objects
         randomData = RandomData.getInstance(RandomData.ALG_SECURE_RANDOM);
@@ -787,6 +778,18 @@ public class Satochip extends javacard.framework.Applet {
         Util.arrayFillNonAtomic(recvBuffer, (short)0, (short)recvBuffer.length, (byte)0);
         if (!ok)
             ISOException.throwIt(SW_UNSUPPORTED_FEATURE);
+    }
+
+    /**
+     * A transient byte array, cleared on deselect if the card allows it, else on reset.
+     * Throws SystemException when the card provides neither: there is no persistent fallback.
+     */
+    static byte[] makeTransientArray(short size) {
+        try {
+            return JCSystem.makeTransientByteArray(size, JCSystem.CLEAR_ON_DESELECT);
+        } catch (SystemException e) {
+            return JCSystem.makeTransientByteArray(size, JCSystem.CLEAR_ON_RESET);
+        }
     }
 
     /** Loads a 32-byte scalar in [1, n-1] into the scratch EC key (see ephemeral_privkey). */
@@ -1459,18 +1462,23 @@ public class Satochip extends javacard.framework.Applet {
         Util.arrayFillNonAtomic(buffer, from, (short)(to-from), (byte)0);
         Util.arrayFillNonAtomic(recvBuffer, (short)0, (short)recvBuffer.length, (byte)0);
         Util.arrayFillNonAtomic(tmpBuffer, (short)0, (short)tmpBuffer.length, (byte)0);
+        Util.arrayFillNonAtomic(ecdsaRam, (short)0, ECDSA_RAM_SIZE, (byte)0);
         Util.arrayFillNonAtomic(Biginteger.buffer1, (short)0, (short)Biginteger.buffer1.length, (byte)0);
         Util.arrayFillNonAtomic(Biginteger.buffer2, (short)0, (short)Biginteger.buffer2.length, (byte)0);
     }
 
     /**
      * Erases the secret left in the scratch EC key (a nonce, a parent BIP32 key, an imported
-     * key...). A persistent fallback key keeps its value: clearKey() would also erase the curve
-     * parameters, which are only set again before use for transient keys.
+     * key...). On a card without transient EC keys (e.g. JCOP3 P60) the scratch key is a
+     * persistent object: clearKey() would also erase its curve parameters, which are only set
+     * again before use for transient keys, so its value is overwritten with the scalar 1
+     * instead. Otherwise the last scalar would stay in EEPROM, also across a power cut.
      */
     private void clearEphemeralKey(){
         if (ephemeral_privkey_transient)
             ephemeral_privkey.clearKey();
+        else
+            ephemeral_privkey.setS(SCALAR_ONE, (short)0, (short)32);
     }
 
     /**
@@ -1776,6 +1784,10 @@ public class Satochip extends javacard.framework.Applet {
      * data: none 
      * return(SECP256K1): [pubkey_size(2b)=65 | pubkey(65b)]
      *      pubkey is the uncompressed public key [0x04 | x(32b) | y(32b)]
+     *      This response carries no signature, and the secure channel encrypts responses
+     *      without authenticating them: the client MUST check that pubkey is a point of the
+     *      curve before using it (a ciphertext altered in transit decrypts to one only with
+     *      negligible probability).
      *
      * Up to protocol v0.16 the response was [coordx_size(2b) | coordx(32b) | sig_size(2b) | sig],
      * the x coordinate signed by the key itself so that the client could recover y from the
@@ -2622,16 +2634,26 @@ public class Satochip extends javacard.framework.Applet {
      *
      * The card's random generator does not enter the signature: (r, s) only depends on (d, z).
      *
-     * The platform still does the heavy arithmetic, but no engine is given k or d:
-     *   - R = k*G is split: w is random, Q = w*G, k' = k * w^-1 mod n, R = k' * Q. The EC engine
-     *     sees w and k', each of which is uniformly random on its own.
-     *   - k^-1 is blinded: b is random, u = k*b, v = (h + r*d)*b, s = v * u^-1. The inversion
-     *     engine sees u (and w), not k.
-     *   - the modular multiplications run on the RSA squaring engine with the secret operand
-     *     replaced by x + m*n for a fresh random m (blindScalar()).
-     *   - the HMAC is assembled on Sha256: with its bytecode backend d and k do not enter a
-     *     platform primitive at all; with its platform backend the SHA-256 engine hashes them.
-     * Known limit: a platform that recorded both w and k' could recombine them into k.
+     * The platform still does the heavy arithmetic. What each of its engines is given:
+     *   - EC engine. R = k*G is split: w is random, Q = w*G, k' = k * w^-1 mod n, R = k' * Q.
+     *     It sees w and k', each of which is uniformly random on its own; the two together
+     *     give k.
+     *   - RSA inversion engine. k^-1 is blinded: b is random, u = k*b, v = (h + r*d)*b,
+     *     s = v * u^-1. It sees u (and w), not k.
+     *   - RSA squaring engine (the modular multiplications). The secret operand x is replaced
+     *     by x + m*n for a fresh random m (blindScalar()). This randomizes the bits that are
+     *     processed, which is a protection against partial leakage such as power analysis,
+     *     and NOTHING MORE: the value is still congruent to x, so an engine that reduced its
+     *     operands modulo n would hold k, d and h + r*d outright, from single calls. It is
+     *     also given b and w^-1 in clear.
+     *   - SHA-256: with the bytecode backend d and k do not enter it; with the platform
+     *     backend it hashes them.
+     *   - the key object holds d, and the random numbers w, b and m come from the platform.
+     * So the platform is NOT kept from knowing k and d. What this construction guarantees is
+     * different: the nonce is derived by the applet, the correct signature is unique, and any
+     * deviation of the platform shows up when the signature is compared byte for byte with
+     * another BIP461 signer. Alternatives for the multiplications (splitting the secret
+     * operand in two, or multiplying in bytecode) are listed as follow-up work.
      *
      * Scratch map while signing. recvBuffer (secrets, all erased in the finally block):
      *   [  0.. 96) ACC    accumulator of the modular multiplications; result in its last 32 bytes
@@ -2640,15 +2662,38 @@ public class Satochip extends javacard.framework.Applet {
      *   [160..192) HK     RFC 6979 state K
      *   [192..224) K      RFC 6979 state V, which is the nonce k once derived
      *   [224..256) X      grind counter block, then w, then b
-     * APDU buffer (the hash to sign has been copied out before):
+     * ecdsaRam (the applet's own transient array, erased in the finally block too):
+     *   [  0.. 32) H2     second copy of h, read only by the verification
+     *   [ 32.. 64) K2     second copy of k, read only by the computation of s;
+     *              S2     then second copy of s, the one the verification reads
+     *   [ 64..128) INV    in/out block of the inversion engine, value in its last 32 bytes
+     *   [128..160) T      k', then h + r*d, then s
+     *   [160..192) V      v, later u1
+     * APDU buffer (the hash to sign has been copied out before), public values only:
      *   [  0.. 65) Q      Q = w*G, later the public key P
      *   [ 65..130) R      R, with r = x(R) mod n at [66..98)
-     *   [130..194) INV    in/out block of the inversion engine, value in its last 32 bytes
-     *   [194..226) T      k', then h + r*d, then s
-     *   [226..258) V      v, later u1
-     * During the verification (public values only) recvBuffer is reused: X holds u2,
-     * [0..65) the point u2*P and [96..161) the point u1*G + u2*P.
      * tmpBuffer: scratch of blindScalar() [0..222) and of HmacSha256 [0..96), never both at once.
+     * During the verification (public values only) recvBuffer is reused: X holds u2,
+     * [0..65) the point u2*P and [96..161) the point R' = u1*G + u2*P.
+     *
+     * Redundancy against a fault in RAM. The nonce is deterministic, so a signature made with a
+     * corrupted h or k next to the correct signature for the same key and hash can give the
+     * private key away, and the verification alone does not see such a corruption when one
+     * stored value feeds both the signature and its check. Therefore:
+     *   - h is stored twice, from two separate reads of the command data: s is computed from H,
+     *     the verification uses H2. If either copy is altered, the signature does not verify.
+     *   - k is stored twice: R is computed from K, s from K2. If either copy is altered, r and s
+     *     no longer belong to the same nonce and the signature does not verify.
+     *   - s is stored twice: the verification reads S2, the output is encoded from T, and the
+     *     two are compared after the verification. If either copy is altered while the signature
+     *     is being checked, nothing is output.
+     *   - the verification result is checked twice, and the r that is output is the x coordinate
+     *     of the point R' the verification recomputed, not the r that went into it.
+     * Not covered: a fault that alters k between the end of its derivation and the copy to K2
+     * (a few instructions later) changes both copies alike; covering it would take a second
+     * derivation of the nonce, i.e. twice the HMAC work.
+     * A fault that makes a discarded nonce out of a good one (r turned high) only moves the card
+     * to the next grind counter: the result is a valid signature under an unrelated nonce.
      */
     private static final short ECDSA_OFFSET_ACC = (short)0;
     private static final short ECDSA_OFFSET_PRODUCT = (short)64; // last 32 bytes of ACC
@@ -2660,10 +2705,19 @@ public class Satochip extends javacard.framework.Applet {
     private static final short ECDSA_SECRETS_END = (short)256;
     private static final short ECDSA_APDU_Q = (short)0;
     private static final short ECDSA_APDU_R = (short)65;
-    private static final short ECDSA_APDU_INV = (short)130;
-    private static final short ECDSA_APDU_T = (short)194;
-    private static final short ECDSA_APDU_V = (short)226;
-    private static final short ECDSA_APDU_SIZE = (short)258;
+    private static final short ECDSA_APDU_SIZE = (short)130;
+    private static final short ECDSA_RAM_H2 = (short)0;
+    private static final short ECDSA_RAM_K2 = (short)32;
+    private static final short ECDSA_RAM_S2 = (short)32; // same place as K2, once k is erased
+    private static final short ECDSA_RAM_INV = (short)64;
+    private static final short ECDSA_RAM_T = (short)128;
+    private static final short ECDSA_RAM_V = (short)160;
+    private static final short ECDSA_RAM_SIZE = (short)192;
+    /** Scratch of the self-built ECDSA that is neither recvBuffer nor the APDU buffer: RAM only, no persistent fallback. */
+    private byte[] ecdsaRam;
+    /** The scalar 1: what a persistent scratch key is overwritten with after use (see clearEphemeralKey()). */
+    private static final byte[] SCALAR_ONE = {
+        0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,(byte)1};
     /**
      * Low-r grinding stops after this many nonces. Each one has probability 1/2 of giving a
      * low r, so the limit is hit with probability 2^-64 on a working card: it only exists so
@@ -2678,7 +2732,7 @@ public class Satochip extends javacard.framework.Applet {
      * Signs the 32-byte hash at buffer[hashOffset] with privkey, as specified in BIP461, and
      * writes the DER-encoded signature at buffer[0].
      * The caller has done all the access control (PIN, 2FA, key selection).
-     * Uses buffer[0..258), recvBuffer, tmpBuffer, the Biginteger buffers and the scratch EC key.
+     * Uses buffer[0..130), recvBuffer, ecdsaRam, tmpBuffer, the Biginteger buffers and the scratch EC key.
      * @return the size of the signature
      */
     private short signEcdsa(ECPrivateKey privkey, byte[] buffer, short hashOffset) {
@@ -2690,8 +2744,11 @@ public class Satochip extends javacard.framework.Applet {
         short sizeout = (short)0;
         try {
             // h = z mod n. z < 2^256 < 2n, so one conditional subtraction is enough. z is public.
+            // Two copies, each read and reduced on its own: H for the signature, H2 for its check.
             Util.arrayCopyNonAtomic(buffer, hashOffset, recvBuffer, ECDSA_OFFSET_H, (short)32);
             reduceModOrder(recvBuffer, ECDSA_OFFSET_H);
+            Util.arrayCopyNonAtomic(buffer, hashOffset, ecdsaRam, ECDSA_RAM_H2, (short)32);
+            reduceModOrder(ecdsaRam, ECDSA_RAM_H2);
 
             // d must be in [1, n-1] (ImportKey and the BIP32 derivation already guarantee it)
             privkey.getS(recvBuffer, ECDSA_OFFSET_D);
@@ -2715,6 +2772,8 @@ public class Satochip extends javacard.framework.Applet {
                     // k is secret: constant-time checks, and no short-circuit between them
                     if (!Biginteger.isZeroCT(recvBuffer, ECDSA_OFFSET_K, (short)32)
                             & Biginteger.lessThanCT(recvBuffer, ECDSA_OFFSET_K, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32)) {
+                        // second copy of k, taken at once: R is computed from K, s from K2
+                        Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_K, ecdsaRam, ECDSA_RAM_K2, (short)32);
                         ecdsaComputeR(buffer);
                         // r = x(R) mod n is public from here on
                         reduceModOrder(buffer, (short)(ECDSA_APDU_R+1));
@@ -2722,7 +2781,7 @@ public class Satochip extends javacard.framework.Applet {
                             if ((buffer[(short)(ECDSA_APDU_R+1)] & (byte)0x80) != (byte)0)
                                 break; // r >= 2^255: grind
                             ecdsaComputeS(buffer);
-                            if (!Biginteger.isZeroCT(buffer, ECDSA_APDU_T, (short)32)) {
+                            if (!Biginteger.isZeroCT(ecdsaRam, ECDSA_RAM_T, (short)32)) {
                                 signed = true;
                                 break;
                             }
@@ -2741,8 +2800,8 @@ public class Satochip extends javacard.framework.Applet {
     }
 
     /**
-     * Common end of a signature: r is at buffer[ECDSA_APDU_R+1], s at buffer[ECDSA_APDU_T] and h
-     * at recvBuffer[ECDSA_OFFSET_H]. Erases the secrets, normalizes s to low-S, verifies the
+     * Common end of a signature: r is at buffer[ECDSA_APDU_R+1], s at ecdsaRam[ECDSA_RAM_T] and
+     * the second copy of h at ecdsaRam[ECDSA_RAM_H2]. Erases the secrets, normalizes s to low-S, verifies the
      * signature and writes its DER encoding at buffer[0].
      * @return the size of the signature
      */
@@ -2750,21 +2809,30 @@ public class Satochip extends javacard.framework.Applet {
         // (r, s) is the signature: nothing secret is needed anymore
         Util.arrayFillNonAtomic(recvBuffer, ECDSA_OFFSET_D, (short)32, (byte)0);
         Util.arrayFillNonAtomic(recvBuffer, ECDSA_OFFSET_HK, (short)(ECDSA_SECRETS_END-ECDSA_OFFSET_HK), (byte)0);
-        Util.arrayFillNonAtomic(buffer, ECDSA_APDU_V, (short)32, (byte)0);
+        Util.arrayFillNonAtomic(ecdsaRam, ECDSA_RAM_V, (short)32, (byte)0);
+        Util.arrayFillNonAtomic(ecdsaRam, ECDSA_RAM_K2, (short)32, (byte)0);
 
         // low-S: s = min(s, n-s) (n is odd, so the two differ)
         Util.arrayCopyNonAtomic(Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, recvBuffer, ECDSA_OFFSET_ACC, (short)32);
-        Biginteger.subtract(recvBuffer, ECDSA_OFFSET_ACC, buffer, ECDSA_APDU_T, (short)32);
-        if (Biginteger.lessThan(recvBuffer, ECDSA_OFFSET_ACC, buffer, ECDSA_APDU_T, (short)32))
-            Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_ACC, buffer, ECDSA_APDU_T, (short)32);
+        Biginteger.subtract(recvBuffer, ECDSA_OFFSET_ACC, ecdsaRam, ECDSA_RAM_T, (short)32);
+        if (Biginteger.lessThan(recvBuffer, ECDSA_OFFSET_ACC, ecdsaRam, ECDSA_RAM_T, (short)32))
+            Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_ACC, ecdsaRam, ECDSA_RAM_T, (short)32);
 
-        // check the signature before any byte of it leaves the card
+        // check the signature before any byte of it leaves the card. The verification
+        // reads the second copy of s.
+        Util.arrayCopyNonAtomic(ecdsaRam, ECDSA_RAM_T, ecdsaRam, ECDSA_RAM_S2, (short)32);
         ecdsaVerify(privkey, buffer);
+        if (!arrayCompareConstantTime(ecdsaRam, ECDSA_RAM_T, ecdsaRam, ECDSA_RAM_S2, (short)32))
+            ISOException.throwIt(SW_ECDSA_VERIFY_FAILED);
+        // the verdict does not rest on that one branch: compare again here, and output the r
+        // that the verification recomputed (x(R') mod n) instead of the r that went into it
+        if (!arrayCompareConstantTime(recvBuffer, (short)(ECDSA_OFFSET_D+1), buffer, (short)(ECDSA_APDU_R+1), (short)32))
+            ISOException.throwIt(SW_ECDSA_VERIFY_FAILED);
 
-        // DER: 30 len 02 len(r) r 02 len(s) s, built aside since it overlaps r in the APDU buffer
+        // DER: 30 len 02 len(r) r 02 len(s) s, built aside in recvBuffer[0..72)
         short offset = (short)(ECDSA_OFFSET_ACC+2);
-        offset = derInteger(buffer, (short)(ECDSA_APDU_R+1), recvBuffer, offset);
-        offset = derInteger(buffer, ECDSA_APDU_T, recvBuffer, offset);
+        offset = derInteger(recvBuffer, (short)(ECDSA_OFFSET_D+1), recvBuffer, offset);
+        offset = derInteger(ecdsaRam, ECDSA_RAM_T, recvBuffer, offset);
         recvBuffer[ECDSA_OFFSET_ACC] = (byte)0x30;
         recvBuffer[(short)(ECDSA_OFFSET_ACC+1)] = (byte)(offset - (short)(ECDSA_OFFSET_ACC+2));
         short size = (short)(offset - ECDSA_OFFSET_ACC);
@@ -2914,32 +2982,34 @@ public class Satochip extends javacard.framework.Applet {
 
         try {
             // rho, kept in V until t is computed
-            Util.arrayCopyNonAtomic(buffer, ISO7816.OFFSET_CDATA, buffer, ECDSA_APDU_V, (short)32);
+            Util.arrayCopyNonAtomic(buffer, ISO7816.OFFSET_CDATA, ecdsaRam, ECDSA_RAM_V, (short)32);
             // c' = tagged_hash("s2c/ecdsa/data", rho) must be the commitment of OP_INIT
-            schnorr_hash_tag(ANTIEXFIL_TAGS, (short)0, ANTIEXFIL_TAG_DATA_SIZE, buffer, ECDSA_APDU_V, (short)32, buffer, ECDSA_APDU_T);
-            if (Util.arrayCompare(buffer, ECDSA_APDU_T, antiexfil_state, ANTIEXFIL_OFFSET_C, (short)32) != (byte)0)
+            schnorr_hash_tag(ANTIEXFIL_TAGS, (short)0, ANTIEXFIL_TAG_DATA_SIZE, ecdsaRam, ECDSA_RAM_V, (short)32, ecdsaRam, ECDSA_RAM_T);
+            if (Util.arrayCompare(ecdsaRam, ECDSA_RAM_T, antiexfil_state, ANTIEXFIL_OFFSET_C, (short)32) != (byte)0)
                 ISOException.throwIt(SW_ECDSA_ANTIEXFIL_COMMITMENT);
             // k0 again, from the RECOMPUTED commitment (see the note above), with z of OP_INIT
-            antiexfilDeriveK0(privkey, buffer, ECDSA_APDU_T);
+            antiexfilDeriveK0(privkey, ecdsaRam, ECDSA_RAM_T);
 
             // t = tagged_hash("s2c/ecdsa/point", R0 compressed | rho), a public value
             Util.arrayCopyNonAtomic(antiexfil_state, (short)(ANTIEXFIL_OFFSET_R0+1), buffer, (short)(ECDSA_APDU_Q+1), (short)32);
             buffer[ECDSA_APDU_Q] = (byte)(0x02 | (antiexfil_state[(short)(ANTIEXFIL_OFFSET_R0+64)] & 0x01));
-            Util.arrayCopyNonAtomic(buffer, ECDSA_APDU_V, buffer, (short)(ECDSA_APDU_Q+33), (short)32);
-            schnorr_hash_tag(ANTIEXFIL_TAGS, ANTIEXFIL_TAG_DATA_SIZE, ANTIEXFIL_TAG_POINT_SIZE, buffer, ECDSA_APDU_Q, (short)65, buffer, ECDSA_APDU_T);
+            Util.arrayCopyNonAtomic(ecdsaRam, ECDSA_RAM_V, buffer, (short)(ECDSA_APDU_Q+33), (short)32);
+            schnorr_hash_tag(ANTIEXFIL_TAGS, ANTIEXFIL_TAG_DATA_SIZE, ANTIEXFIL_TAG_POINT_SIZE, buffer, ECDSA_APDU_Q, (short)65, ecdsaRam, ECDSA_RAM_T);
             // t must be in [1, n-1] (it is, except with negligible probability)
-            if (Biginteger.equalZero(buffer, ECDSA_APDU_T, (short)32)
-                    || !Biginteger.lessThan(buffer, ECDSA_APDU_T, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32))
+            if (Biginteger.equalZero(ecdsaRam, ECDSA_RAM_T, (short)32)
+                    || !Biginteger.lessThan(ecdsaRam, ECDSA_RAM_T, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32))
                 ISOException.throwIt(SW_ECDSA_NONCE_ERROR);
 
             // k = k0 + t mod n, in constant time (k0 is secret); k must not be 0
-            Biginteger.addModCT(recvBuffer, ECDSA_OFFSET_K, buffer, ECDSA_APDU_T,
+            Biginteger.addModCT(recvBuffer, ECDSA_OFFSET_K, ecdsaRam, ECDSA_RAM_T,
                     Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32, recvBuffer, ECDSA_OFFSET_ACC);
             if (Biginteger.isZeroCT(recvBuffer, ECDSA_OFFSET_K, (short)32))
                 ISOException.throwIt(SW_ECDSA_NONCE_ERROR);
+            // s is computed from the second copy of k (see "Redundancy" in the scratch map)
+            Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_K, ecdsaRam, ECDSA_RAM_K2, (short)32);
 
             // R = R0 + t*G, on public values: the point addition engine with the scalar t
-            setEphemeralScalar(buffer, ECDSA_APDU_T);
+            setEphemeralScalar(ecdsaRam, ECDSA_RAM_T);
             keyAgreementAdd.init(ephemeral_privkey);
             keyAgreementAdd.generateSecret(antiexfil_state, ANTIEXFIL_OFFSET_R0, (short)65, buffer, ECDSA_APDU_R);
             // r = x(R) mod n
@@ -2950,7 +3020,7 @@ public class Satochip extends javacard.framework.Applet {
             // s = k^-1 (h + r*d), then the common end: low-S, verification, DER.
             // r and k do not come from the same computation here: the verification is what ties them.
             ecdsaComputeS(buffer);
-            if (Biginteger.isZeroCT(buffer, ECDSA_APDU_T, (short)32))
+            if (Biginteger.isZeroCT(ecdsaRam, ECDSA_RAM_T, (short)32))
                 ISOException.throwIt(SW_ECDSA_NONCE_ERROR);
             sizeout = ecdsaFinish(privkey, buffer);
         } catch (CryptoException e) {
@@ -2969,8 +3039,11 @@ public class Satochip extends javacard.framework.Applet {
      * As in BIP461 sign(), the next output of the generator is taken while the nonce is not in [1, n-1].
      */
     private void antiexfilDeriveK0(ECPrivateKey privkey, byte[] commitment, short commitmentOff) {
+        // two copies of h, as in signEcdsa(): H for the signature, H2 for its check
         Util.arrayCopyNonAtomic(antiexfil_state, ANTIEXFIL_OFFSET_Z, recvBuffer, ECDSA_OFFSET_H, (short)32);
         reduceModOrder(recvBuffer, ECDSA_OFFSET_H);
+        Util.arrayCopyNonAtomic(antiexfil_state, ANTIEXFIL_OFFSET_Z, ecdsaRam, ECDSA_RAM_H2, (short)32);
+        reduceModOrder(ecdsaRam, ECDSA_RAM_H2);
         privkey.getS(recvBuffer, ECDSA_OFFSET_D);
         if (Biginteger.isZeroCT(recvBuffer, ECDSA_OFFSET_D, (short)32)
                 | !Biginteger.lessThanCT(recvBuffer, ECDSA_OFFSET_D, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32))
@@ -3047,7 +3120,13 @@ public class Satochip extends javacard.framework.Applet {
 
     /** Draws a uniformly random scalar in [1, n-1] (rejection sampling) at dst[dstOff]. */
     private void randomScalar(byte[] dst, short dstOff) {
+        // a draw is rejected with probability 2^-128: more than a few in a row means the
+        // random generator is stuck, and the card must not loop forever on it
+        short tries = (short)0;
         do {
+            if (tries >= ECDSA_RETRY_LIMIT)
+                ISOException.throwIt(SW_ECDSA_NONCE_ERROR);
+            tries++;
             randomData.generateData(dst, dstOff, (short)32);
         } while (Biginteger.isZeroCT(dst, dstOff, (short)32)
                 | !Biginteger.lessThanCT(dst, dstOff, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32));
@@ -3064,10 +3143,10 @@ public class Satochip extends javacard.framework.Applet {
         Biginteger.mod(recvBuffer, ECDSA_OFFSET_ACC, BIGNUM_SIZE, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32);
     }
 
-    /** Replaces the 32-byte x at buffer[ECDSA_APDU_INV+32] with x^-1 mod n (see Biginteger.modInv()). */
-    private static void invertModOrder(byte[] buffer) {
-        Util.arrayFillNonAtomic(buffer, ECDSA_APDU_INV, (short)32, (byte)0);
-        Biginteger.modInv(buffer, ECDSA_APDU_INV);
+    /** Replaces the 32-byte x at ecdsaRam[ECDSA_RAM_INV+32] with x^-1 mod n (see Biginteger.modInv()). */
+    private void invertModOrder() {
+        Util.arrayFillNonAtomic(ecdsaRam, ECDSA_RAM_INV, (short)32, (byte)0);
+        Biginteger.modInv(ecdsaRam, ECDSA_RAM_INV);
     }
 
     /**
@@ -3080,13 +3159,13 @@ public class Satochip extends javacard.framework.Applet {
         setEphemeralScalar(recvBuffer, ECDSA_OFFSET_X);
         getPublicKey(ephemeral_privkey, buffer, ECDSA_APDU_Q);
         // w^-1
-        Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_X, buffer, (short)(ECDSA_APDU_INV+32), (short)32);
-        invertModOrder(buffer);
+        Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_X, ecdsaRam, (short)(ECDSA_RAM_INV+32), (short)32);
+        invertModOrder();
         // k' = k * w^-1 mod n, with k blinded. k' is not 0: neither factor is.
-        mulModOrder(buffer, (short)(ECDSA_APDU_INV+32), recvBuffer, ECDSA_OFFSET_K);
-        Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_PRODUCT, buffer, ECDSA_APDU_T, (short)32);
+        mulModOrder(ecdsaRam, (short)(ECDSA_RAM_INV+32), recvBuffer, ECDSA_OFFSET_K);
+        Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_PRODUCT, ecdsaRam, ECDSA_RAM_T, (short)32);
         // R = k' * Q
-        setEphemeralScalar(buffer, ECDSA_APDU_T);
+        setEphemeralScalar(ecdsaRam, ECDSA_RAM_T);
         keyAgreement.init(ephemeral_privkey);
         keyAgreement.generateSecret(buffer, ECDSA_APDU_Q, (short)65, buffer, ECDSA_APDU_R);
     }
@@ -3094,26 +3173,26 @@ public class Satochip extends javacard.framework.Applet {
     /**
      * s = k^-1 * (h + r*d) mod n without inverting k itself: for a fresh random b,
      * u = k*b, v = (h + r*d)*b, s = v * u^-1. b cancels out, so s only depends on k, d and h.
-     * Leaves s at buffer[ECDSA_APDU_T].
+     * Leaves s at ecdsaRam[ECDSA_RAM_T].
      */
     private void ecdsaComputeS(byte[] buffer) {
-        // u = b*k, then u^-1
+        // u = b*k, then u^-1. k is read from its second copy (see "Redundancy" above).
         randomScalar(recvBuffer, ECDSA_OFFSET_X);
-        mulModOrder(recvBuffer, ECDSA_OFFSET_X, recvBuffer, ECDSA_OFFSET_K);
-        Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_PRODUCT, buffer, (short)(ECDSA_APDU_INV+32), (short)32);
-        invertModOrder(buffer);
+        mulModOrder(recvBuffer, ECDSA_OFFSET_X, ecdsaRam, ECDSA_RAM_K2);
+        Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_PRODUCT, ecdsaRam, (short)(ECDSA_RAM_INV+32), (short)32);
+        invertModOrder();
         // t = h + r*d mod n, with d blinded
         Util.arrayFillNonAtomic(recvBuffer, ECDSA_OFFSET_ACC, BIGNUM_SIZE, (byte)0);
         Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_H, recvBuffer, ECDSA_OFFSET_PRODUCT, (short)32);
         blindedMulAdd(recvBuffer, ECDSA_OFFSET_ACC, buffer, (short)(ECDSA_APDU_R+1), recvBuffer, ECDSA_OFFSET_D);
         Biginteger.mod(recvBuffer, ECDSA_OFFSET_ACC, BIGNUM_SIZE, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32);
-        Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_PRODUCT, buffer, ECDSA_APDU_T, (short)32);
+        Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_PRODUCT, ecdsaRam, ECDSA_RAM_T, (short)32);
         // v = b*t mod n, with t blinded
-        mulModOrder(recvBuffer, ECDSA_OFFSET_X, buffer, ECDSA_APDU_T);
-        Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_PRODUCT, buffer, ECDSA_APDU_V, (short)32);
+        mulModOrder(recvBuffer, ECDSA_OFFSET_X, ecdsaRam, ECDSA_RAM_T);
+        Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_PRODUCT, ecdsaRam, ECDSA_RAM_V, (short)32);
         // s = u^-1 * v mod n, with v blinded
-        mulModOrder(buffer, (short)(ECDSA_APDU_INV+32), buffer, ECDSA_APDU_V);
-        Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_PRODUCT, buffer, ECDSA_APDU_T, (short)32);
+        mulModOrder(ecdsaRam, (short)(ECDSA_RAM_INV+32), ecdsaRam, ECDSA_RAM_V);
+        Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_PRODUCT, ecdsaRam, ECDSA_RAM_T, (short)32);
     }
 
     /**
@@ -3131,7 +3210,8 @@ public class Satochip extends javacard.framework.Applet {
 
     /**
      * Verifies the signature that signEcdsa() just computed, r at buffer[ECDSA_APDU_R+1] and s at
-     * buffer[ECDSA_APDU_T], against h at recvBuffer[ECDSA_OFFSET_H] and the public key of privkey,
+     * ecdsaRam[ECDSA_RAM_S2], against the second copy of h at ecdsaRam[ECDSA_RAM_H2] (not the copy
+     * the signature was computed from) and the public key of privkey,
      * with the textbook ECDSA verification (BIP461 verify()):
      *   u1 = h * s^-1 mod n,  u2 = r * s^-1 mod n,  R' = u1*G + u2*P,  accept if x(R') mod n = r
      * A signature that does not verify is the sign of a computation error or of an injected
@@ -3142,30 +3222,31 @@ public class Satochip extends javacard.framework.Applet {
      * Only public values are handled (r, s, h, P): no blinding is needed. The platform Signature
      * engine is not involved: u2*P is a key agreement with y on the base point P, and the sum
      * with u1*G is the ALG_EC_PACE_GM key agreement (the multAndAdd of JCMathLib's ECPoint).
-     * r and s are left untouched.
+     * r and s are left untouched. On success the recomputed x(R') mod n is left at
+     * recvBuffer[ECDSA_OFFSET_D+1], for the caller's own comparison and for the output.
      */
     private void ecdsaVerify(ECPrivateKey privkey, byte[] buffer) {
         boolean valid = false;
         try {
             // s^-1 (s is not 0)
-            Util.arrayCopyNonAtomic(buffer, ECDSA_APDU_T, buffer, (short)(ECDSA_APDU_INV+32), (short)32);
-            invertModOrder(buffer);
+            Util.arrayCopyNonAtomic(ecdsaRam, ECDSA_RAM_S2, ecdsaRam, (short)(ECDSA_RAM_INV+32), (short)32);
+            invertModOrder();
             // u2 = r * s^-1 mod n: not 0, since r and s are not
-            mulModOrderPublic(buffer, (short)(ECDSA_APDU_R+1), buffer, (short)(ECDSA_APDU_INV+32));
+            mulModOrderPublic(buffer, (short)(ECDSA_APDU_R+1), ecdsaRam, (short)(ECDSA_RAM_INV+32));
             Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_PRODUCT, recvBuffer, ECDSA_OFFSET_X, (short)32);
             // u1 = h * s^-1 mod n: 0 when h is 0, i.e. when the hash is a multiple of n
-            mulModOrderPublic(recvBuffer, ECDSA_OFFSET_H, buffer, (short)(ECDSA_APDU_INV+32));
-            Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_PRODUCT, buffer, ECDSA_APDU_V, (short)32);
+            mulModOrderPublic(ecdsaRam, ECDSA_RAM_H2, ecdsaRam, (short)(ECDSA_RAM_INV+32));
+            Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_PRODUCT, ecdsaRam, ECDSA_RAM_V, (short)32);
             // P = d*G, computed by the key object itself, then u2*P
             getPublicKey(privkey, buffer, ECDSA_APDU_Q);
             setEphemeralScalar(recvBuffer, ECDSA_OFFSET_X);
             keyAgreement.init(ephemeral_privkey);
             keyAgreement.generateSecret(buffer, ECDSA_APDU_Q, (short)65, recvBuffer, ECDSA_OFFSET_ACC);
             // R' = u1*G + u2*P. A key object does not take the scalar 0: then R' = u2*P.
-            if (Biginteger.equalZero(buffer, ECDSA_APDU_V, (short)32)) {
+            if (Biginteger.equalZero(ecdsaRam, ECDSA_RAM_V, (short)32)) {
                 Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_ACC, recvBuffer, ECDSA_OFFSET_D, (short)65);
             } else {
-                setEphemeralScalar(buffer, ECDSA_APDU_V);
+                setEphemeralScalar(ecdsaRam, ECDSA_RAM_V);
                 keyAgreementAdd.init(ephemeral_privkey);
                 keyAgreementAdd.generateSecret(recvBuffer, ECDSA_OFFSET_ACC, (short)65, recvBuffer, ECDSA_OFFSET_D);
             }
