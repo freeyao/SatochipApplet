@@ -113,8 +113,9 @@ public class Satochip extends javacard.framework.Applet {
     // 0.15-0.1: MuSig2 support (beta): add mechanism to ensure that the BIP327 encrypted secnonce cannot be reused.
     // 0.16-0.1: security fixes & hardening (ResetKey 2FA HMAC fix, EC point validation, Musig2SignHash 2FA fix, MuSig2 nonce counter overflow fix, resetToFactory completion, BIP341 taproot tweak fix, ImportKey hardening, constant-time MAC comparisons, reset-to-factory refactoring, authentikey mgmt, transient AES session keys, removal of ParseTransaction/SignTransaction/signMessage, add GET_RANDOM, single PIN/PUK mgmt, ...)
     // 0.17-0.1: self-built ECDSA for SignTransactionHash (BIP461: RFC 6979 nonce, low-r, low-S, verified before output) instead of the platform Signature engine; the three self-signatures are removed and the full public key is returned instead (getBIP32ExtendedKey, getPublicKeyFromPrivate, InitiateSecureChannel: new response formats)
+    // 0.18-0.1: anti-exfil ECDSA (sign-to-contract, secp256k1-zkp ecdsa_s2c protocol): new command SignTransactionHashAntiExfil (0x70)
     private final static byte PROTOCOL_MAJOR_VERSION = (byte) 0; 
-    private final static byte PROTOCOL_MINOR_VERSION = (byte) 17;
+    private final static byte PROTOCOL_MINOR_VERSION = (byte) 18;
     private final static byte APPLET_MAJOR_VERSION = (byte) 0;
     private final static byte APPLET_MINOR_VERSION = (byte) 1;
 
@@ -180,6 +181,7 @@ public class Satochip extends javacard.framework.Applet {
     private final static byte INS_SET_2FA_KEY = (byte) 0x79;    
     private final static byte INS_RESET_2FA_KEY = (byte) 0x78;
     private final static byte INS_SIGN_TRANSACTION_HASH= (byte) 0x7A;
+    private final static byte INS_SIGN_TRANSACTION_HASH_ANTIEXFIL= (byte) 0x70;
     private final static byte INS_TAPROOT_TWEAK_PRIVKEY= (byte) 0x7C;
     private final static byte INS_SIGN_SCHNORR_HASH= (byte) 0x7B;
 
@@ -311,6 +313,8 @@ public class Satochip extends javacard.framework.Applet {
     private final static short SW_ECDSA_VERIFY_FAILED = (short) 0x9C4D;
     /** Self-built ECDSA: no acceptable nonce was found within the attempt limits (not expected to happen) */
     private final static short SW_ECDSA_NONCE_ERROR = (short) 0x9C4E;
+    /** Anti-exfil ECDSA: the host randomness revealed in the second step does not match the commitment of the first step */
+    private final static short SW_ECDSA_ANTIEXFIL_COMMITMENT = (short) 0x9C4F;
 
     /** MuSig2 errors **/
     private final static short SW_BIP327_WRONG_SECNONCE = (short) 0x9C44;
@@ -688,6 +692,13 @@ public class Satochip extends javacard.framework.Applet {
         trusted_pubkey = new byte[PUBKEY_SIZE];
         secret_sc_sessionkey = buildTransientAES128Key();
 
+        // anti-exfil ECDSA: public values kept between the two steps of the protocol, in RAM only
+        try {
+            antiexfil_state = JCSystem.makeTransientByteArray(ANTIEXFIL_STATE_SIZE, JCSystem.CLEAR_ON_DESELECT);
+        } catch (SystemException e) {
+            antiexfil_state = JCSystem.makeTransientByteArray(ANTIEXFIL_STATE_SIZE, JCSystem.CLEAR_ON_RESET);
+        }
+
         register();
     } // end of constructor
 
@@ -1038,6 +1049,9 @@ public class Satochip extends javacard.framework.Applet {
             break;
         case INS_SIGN_TRANSACTION_HASH:
             sizeout= SignTransactionHash(apdu, buffer);
+            break;
+        case INS_SIGN_TRANSACTION_HASH_ANTIEXFIL:
+            sizeout= SignTransactionHashAntiExfil(apdu, buffer);
             break;
         case INS_SIGN_SCHNORR_HASH:
             sizeout= SignSchnorrHash(apdu, buffer);
@@ -2702,7 +2716,8 @@ public class Satochip extends javacard.framework.Applet {
                     if (!Biginteger.isZeroCT(recvBuffer, ECDSA_OFFSET_K, (short)32)
                             & Biginteger.lessThanCT(recvBuffer, ECDSA_OFFSET_K, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32)) {
                         ecdsaComputeR(buffer);
-                        // r is public from here on
+                        // r = x(R) mod n is public from here on
+                        reduceModOrder(buffer, (short)(ECDSA_APDU_R+1));
                         if (!Biginteger.equalZero(buffer, (short)(ECDSA_APDU_R+1), (short)32)) {
                             if ((buffer[(short)(ECDSA_APDU_R+1)] & (byte)0x80) != (byte)0)
                                 break; // r >= 2^255: grind
@@ -2717,33 +2732,257 @@ public class Satochip extends javacard.framework.Applet {
                 }
             }
 
-            // (r, s) is the signature: nothing secret is needed anymore
-            Util.arrayFillNonAtomic(recvBuffer, ECDSA_OFFSET_D, (short)32, (byte)0);
-            Util.arrayFillNonAtomic(recvBuffer, ECDSA_OFFSET_HK, (short)(ECDSA_SECRETS_END-ECDSA_OFFSET_HK), (byte)0);
-            Util.arrayFillNonAtomic(buffer, ECDSA_APDU_V, (short)32, (byte)0);
-
-            // low-S: s = min(s, n-s) (n is odd, so the two differ)
-            Util.arrayCopyNonAtomic(Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, recvBuffer, ECDSA_OFFSET_ACC, (short)32);
-            Biginteger.subtract(recvBuffer, ECDSA_OFFSET_ACC, buffer, ECDSA_APDU_T, (short)32);
-            if (Biginteger.lessThan(recvBuffer, ECDSA_OFFSET_ACC, buffer, ECDSA_APDU_T, (short)32))
-                Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_ACC, buffer, ECDSA_APDU_T, (short)32);
-
-            // check the signature before any byte of it leaves the card
-            ecdsaVerify(privkey, buffer);
-
-            // DER: 30 len 02 len(r) r 02 len(s) s, built aside since it overlaps r in the APDU buffer
-            short offset = (short)(ECDSA_OFFSET_ACC+2);
-            offset = derInteger(buffer, (short)(ECDSA_APDU_R+1), recvBuffer, offset);
-            offset = derInteger(buffer, ECDSA_APDU_T, recvBuffer, offset);
-            recvBuffer[ECDSA_OFFSET_ACC] = (byte)0x30;
-            recvBuffer[(short)(ECDSA_OFFSET_ACC+1)] = (byte)(offset - (short)(ECDSA_OFFSET_ACC+2));
-            sizeout = (short)(offset - ECDSA_OFFSET_ACC);
-            Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_ACC, buffer, (short)0, sizeout);
+            sizeout = ecdsaFinish(privkey, buffer);
         } finally {
             Sha256.clear();
             clearSigningScratch(buffer, sizeout, ECDSA_APDU_SIZE);
         }
         return sizeout;
+    }
+
+    /**
+     * Common end of a signature: r is at buffer[ECDSA_APDU_R+1], s at buffer[ECDSA_APDU_T] and h
+     * at recvBuffer[ECDSA_OFFSET_H]. Erases the secrets, normalizes s to low-S, verifies the
+     * signature and writes its DER encoding at buffer[0].
+     * @return the size of the signature
+     */
+    private short ecdsaFinish(ECPrivateKey privkey, byte[] buffer) {
+        // (r, s) is the signature: nothing secret is needed anymore
+        Util.arrayFillNonAtomic(recvBuffer, ECDSA_OFFSET_D, (short)32, (byte)0);
+        Util.arrayFillNonAtomic(recvBuffer, ECDSA_OFFSET_HK, (short)(ECDSA_SECRETS_END-ECDSA_OFFSET_HK), (byte)0);
+        Util.arrayFillNonAtomic(buffer, ECDSA_APDU_V, (short)32, (byte)0);
+
+        // low-S: s = min(s, n-s) (n is odd, so the two differ)
+        Util.arrayCopyNonAtomic(Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, recvBuffer, ECDSA_OFFSET_ACC, (short)32);
+        Biginteger.subtract(recvBuffer, ECDSA_OFFSET_ACC, buffer, ECDSA_APDU_T, (short)32);
+        if (Biginteger.lessThan(recvBuffer, ECDSA_OFFSET_ACC, buffer, ECDSA_APDU_T, (short)32))
+            Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_ACC, buffer, ECDSA_APDU_T, (short)32);
+
+        // check the signature before any byte of it leaves the card
+        ecdsaVerify(privkey, buffer);
+
+        // DER: 30 len 02 len(r) r 02 len(s) s, built aside since it overlaps r in the APDU buffer
+        short offset = (short)(ECDSA_OFFSET_ACC+2);
+        offset = derInteger(buffer, (short)(ECDSA_APDU_R+1), recvBuffer, offset);
+        offset = derInteger(buffer, ECDSA_APDU_T, recvBuffer, offset);
+        recvBuffer[ECDSA_OFFSET_ACC] = (byte)0x30;
+        recvBuffer[(short)(ECDSA_OFFSET_ACC+1)] = (byte)(offset - (short)(ECDSA_OFFSET_ACC+2));
+        short size = (short)(offset - ECDSA_OFFSET_ACC);
+        Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_ACC, buffer, (short)0, size);
+        return size;
+    }
+
+    /****************************************
+     *   Anti-exfil ECDSA (sign-to-contract) *
+     ****************************************/
+
+    /*
+     * Second nonce path of the self-built ECDSA: the host contributes randomness to the nonce and
+     * can check, for every signature, that the card used it. This is the ECDSA Anti-Exfil
+     * protocol of secp256k1-zkp (module ecdsa_s2c, as used by Jade and BitBox02); the values on
+     * the wire are byte-identical to that library's.
+     *
+     *   host:  rho random, c = tagged_hash("s2c/ecdsa/data", rho)                -> z, c
+     *   card:  k0 = RFC 6979 nonce of (d, z) with extra data c, R0 = k0*G        <- R0 (33 bytes)
+     *   host:                                                                     -> rho
+     *   card:  t = tagged_hash("s2c/ecdsa/point", R0 | rho), k = k0 + t mod n,
+     *          ordinary ECDSA signature with the nonce k, low-S                   <- (r, s)
+     *   host:  checks x(R0 + t*G) mod n = r, then verifies the signature
+     * (tagged_hash is the BIP340 construction.) The card commits to R0 before it learns rho, so
+     * it cannot choose the final nonce: whatever it did to pick k0, k is shifted by a value it
+     * could not predict. There is no low-r grinding on this path.
+     *
+     * secp256k1-zkp keeps no state and computes three secret scalar multiplications (R0 twice,
+     * then R). Each of them costs a split multiplication here, so this implementation keeps the
+     * PUBLIC values of the first step in RAM (z, c, R0, the key number) and computes
+     * R = R0 + t*G with the point addition engine, on public values: one secret scalar
+     * multiplication in total. Two independent checks keep this safe:
+     *   - the second step recomputes c from rho and compares it with the stored commitment;
+     *   - k0 is derived again from the RECOMPUTED c, never from the stored one. If the comparison
+     *     were skipped by a fault, k0 would not match the stored R0, the signature would not be
+     *     valid, and ecdsaVerify() would refuse to output it.
+     * The same k0 can therefore never be combined with two different rho, which is what would
+     * leak the private key.
+     *
+     * A host that gets R0 and then an error must retry with the SAME rho and check that the card
+     * returns the same R0, otherwise a card could bias the nonce by failing selectively. The
+     * first step is deterministic in (key, z, c), so an honest card does return the same R0.
+     */
+    private static final byte[] ANTIEXFIL_TAGS = {
+        's','2','c','/','e','c','d','s','a','/','d','a','t','a',
+        's','2','c','/','e','c','d','s','a','/','p','o','i','n','t'};
+    private static final short ANTIEXFIL_TAG_DATA_SIZE = (short)14;
+    private static final short ANTIEXFIL_TAG_POINT_SIZE = (short)15;
+    // antiexfil_state = [valid(1b) | key_nb(1b) | z(32b) | c(32b) | R0(65b, uncompressed)]: public values only
+    private static final short ANTIEXFIL_OFFSET_VALID = (short)0;
+    private static final short ANTIEXFIL_OFFSET_KEYNB = (short)1;
+    private static final short ANTIEXFIL_OFFSET_Z = (short)2;
+    private static final short ANTIEXFIL_OFFSET_C = (short)34;
+    private static final short ANTIEXFIL_OFFSET_R0 = (short)66;
+    private static final short ANTIEXFIL_STATE_SIZE = (short)131;
+    private static final byte ANTIEXFIL_VALID = (byte)0x5A;
+    private byte[] antiexfil_state;
+
+    /**
+     * Signs a hash with the ECDSA Anti-Exfil protocol, in two steps.
+     * If 2FA is enabled, the first step requires the same HMAC as SignTransactionHash.
+     *
+     * ins: 0x70
+     * p1: key number or 0xFF for the last derived Bip32 extended key (the same in both steps)
+     * p2: OP_INIT (0x01) or OP_FINALIZE (0x03)
+     *
+     * OP_INIT
+     *   data: [hash(32b) | host_commitment(32b) | option: 2FA-flag(2b)|hmac(20b)]
+     *      host_commitment = tagged_hash("s2c/ecdsa/data", rho), for a random 32-byte rho the host keeps
+     *   return: [R0(33b)] the signer commitment, a compressed point
+     *
+     * OP_FINALIZE
+     *   data: [rho(32b)]
+     *   return: [sig] the DER-encoded signature, low-S; r is not ground to low-r on this path
+     *   The values of OP_INIT are consumed: a new OP_INIT is needed for every OP_FINALIZE.
+     *   SW_INCORRECT_INITIALIZATION if no OP_INIT is pending, SW_INCORRECT_P1 if p1 differs,
+     *   SW_ECDSA_ANTIEXFIL_COMMITMENT (0x9C4F) if rho does not match the commitment.
+     *
+     * The host must check that x(R0 + t*G) mod n = r with t = tagged_hash("s2c/ecdsa/point", R0 | rho),
+     * and verify the signature (secp256k1_anti_exfil_host_verify does both).
+     */
+    private short SignTransactionHashAntiExfil(APDU apdu, byte[] buffer){
+        // check that PIN has been entered previously
+        if (!pin.isValidated())
+            ISOException.throwIt(SW_UNAUTHORIZED);
+        if ((short)buffer.length < ECDSA_APDU_SIZE)
+            ISOException.throwIt(SW_INTERNAL_ERROR);
+
+        byte key_nb = buffer[ISO7816.OFFSET_P1];
+        byte op = buffer[ISO7816.OFFSET_P2];
+        short bytesLeft = Util.makeShort((byte) 0x00, buffer[ISO7816.OFFSET_LC]);
+        short sizeout = (short)0;
+
+        if (op == OP_INIT) {
+            // whatever was pending is dropped
+            antiexfil_state[ANTIEXFIL_OFFSET_VALID] = (byte)0;
+            ECPrivateKey privkey = getSigningKey(key_nb);
+            if (bytesLeft < (short)64)
+                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+
+            // check 2FA if required: the approval is for the hash, as in SignTransactionHash
+            if(needs_2FA){
+                if (bytesLeft < (short)(64+MessageDigest.LENGTH_SHA+(short)2))
+                    ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+                short hmac_flags= Util.getShort(buffer, (short)(ISO7816.OFFSET_CDATA+64));
+                if (hmac_flags!=HMAC_CHALRESP_2FA)
+                    ISOException.throwIt(SW_INCORRECT_ALG);
+                // hmac of 64-bytes msg: ( 32bytes tx_hash | 32bytes 0xCC-padding)
+                Util.arrayCopyNonAtomic(buffer, (short)ISO7816.OFFSET_CDATA, recvBuffer, (short)0, (short)32);
+                Util.arrayFillNonAtomic(recvBuffer, (short)32, (short)32, (byte)0xCC);
+                HmacSha160.computeHmacSha160(data2FA, OFFSET_2FA_HMACKEY, (short)20, recvBuffer, (short)0, (short)64, recvBuffer, (short)64);
+                if (!arrayCompareConstantTime(buffer, (short)(ISO7816.OFFSET_CDATA+64+2), recvBuffer, (short)64, (short)20))
+                    ISOException.throwIt(SW_SIGNATURE_INVALID);
+            }
+
+            try {
+                // keep z and c (public), then derive k0 = RFC 6979(d, h, extra = c)
+                Util.arrayCopyNonAtomic(buffer, ISO7816.OFFSET_CDATA, antiexfil_state, ANTIEXFIL_OFFSET_Z, (short)64);
+                antiexfil_state[ANTIEXFIL_OFFSET_KEYNB] = key_nb;
+                antiexfilDeriveK0(privkey, antiexfil_state, ANTIEXFIL_OFFSET_C);
+                // R0 = k0*G, by the split multiplication
+                ecdsaComputeR(buffer);
+                Util.arrayCopyNonAtomic(buffer, ECDSA_APDU_R, antiexfil_state, ANTIEXFIL_OFFSET_R0, (short)65);
+                // return R0 compressed
+                Util.arrayCopyNonAtomic(antiexfil_state, (short)(ANTIEXFIL_OFFSET_R0+1), buffer, (short)1, (short)32);
+                buffer[(short)0] = (byte)(0x02 | (antiexfil_state[(short)(ANTIEXFIL_OFFSET_R0+64)] & 0x01));
+                antiexfil_state[ANTIEXFIL_OFFSET_VALID] = ANTIEXFIL_VALID;
+                sizeout = (short)33;
+            } finally {
+                Sha256.clear();
+                clearSigningScratch(buffer, sizeout, ECDSA_APDU_SIZE);
+            }
+            return sizeout;
+        }
+        if (op != OP_FINALIZE)
+            ISOException.throwIt(SW_INCORRECT_P2);
+
+        // OP_FINALIZE: the pending values are used once, whatever happens next
+        if (antiexfil_state[ANTIEXFIL_OFFSET_VALID] != ANTIEXFIL_VALID)
+            ISOException.throwIt(SW_INCORRECT_INITIALIZATION);
+        antiexfil_state[ANTIEXFIL_OFFSET_VALID] = (byte)0;
+        if (antiexfil_state[ANTIEXFIL_OFFSET_KEYNB] != key_nb)
+            ISOException.throwIt(SW_INCORRECT_P1);
+        ECPrivateKey privkey = getSigningKey(key_nb);
+        if (bytesLeft < (short)32)
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+
+        try {
+            // rho, kept in V until t is computed
+            Util.arrayCopyNonAtomic(buffer, ISO7816.OFFSET_CDATA, buffer, ECDSA_APDU_V, (short)32);
+            // c' = tagged_hash("s2c/ecdsa/data", rho) must be the commitment of OP_INIT
+            schnorr_hash_tag(ANTIEXFIL_TAGS, (short)0, ANTIEXFIL_TAG_DATA_SIZE, buffer, ECDSA_APDU_V, (short)32, buffer, ECDSA_APDU_T);
+            if (Util.arrayCompare(buffer, ECDSA_APDU_T, antiexfil_state, ANTIEXFIL_OFFSET_C, (short)32) != (byte)0)
+                ISOException.throwIt(SW_ECDSA_ANTIEXFIL_COMMITMENT);
+            // k0 again, from the RECOMPUTED commitment (see the note above), with z of OP_INIT
+            antiexfilDeriveK0(privkey, buffer, ECDSA_APDU_T);
+
+            // t = tagged_hash("s2c/ecdsa/point", R0 compressed | rho), a public value
+            Util.arrayCopyNonAtomic(antiexfil_state, (short)(ANTIEXFIL_OFFSET_R0+1), buffer, (short)(ECDSA_APDU_Q+1), (short)32);
+            buffer[ECDSA_APDU_Q] = (byte)(0x02 | (antiexfil_state[(short)(ANTIEXFIL_OFFSET_R0+64)] & 0x01));
+            Util.arrayCopyNonAtomic(buffer, ECDSA_APDU_V, buffer, (short)(ECDSA_APDU_Q+33), (short)32);
+            schnorr_hash_tag(ANTIEXFIL_TAGS, ANTIEXFIL_TAG_DATA_SIZE, ANTIEXFIL_TAG_POINT_SIZE, buffer, ECDSA_APDU_Q, (short)65, buffer, ECDSA_APDU_T);
+            // t must be in [1, n-1] (it is, except with negligible probability)
+            if (Biginteger.equalZero(buffer, ECDSA_APDU_T, (short)32)
+                    || !Biginteger.lessThan(buffer, ECDSA_APDU_T, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32))
+                ISOException.throwIt(SW_ECDSA_NONCE_ERROR);
+
+            // k = k0 + t mod n, in constant time (k0 is secret); k must not be 0
+            Biginteger.addModCT(recvBuffer, ECDSA_OFFSET_K, buffer, ECDSA_APDU_T,
+                    Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32, recvBuffer, ECDSA_OFFSET_ACC);
+            if (Biginteger.isZeroCT(recvBuffer, ECDSA_OFFSET_K, (short)32))
+                ISOException.throwIt(SW_ECDSA_NONCE_ERROR);
+
+            // R = R0 + t*G, on public values: the point addition engine with the scalar t
+            setEphemeralScalar(buffer, ECDSA_APDU_T);
+            keyAgreementAdd.init(ephemeral_privkey);
+            keyAgreementAdd.generateSecret(antiexfil_state, ANTIEXFIL_OFFSET_R0, (short)65, buffer, ECDSA_APDU_R);
+            // r = x(R) mod n
+            reduceModOrder(buffer, (short)(ECDSA_APDU_R+1));
+            if (Biginteger.equalZero(buffer, (short)(ECDSA_APDU_R+1), (short)32))
+                ISOException.throwIt(SW_ECDSA_NONCE_ERROR);
+
+            // s = k^-1 (h + r*d), then the common end: low-S, verification, DER.
+            // r and k do not come from the same computation here: the verification is what ties them.
+            ecdsaComputeS(buffer);
+            if (Biginteger.isZeroCT(buffer, ECDSA_APDU_T, (short)32))
+                ISOException.throwIt(SW_ECDSA_NONCE_ERROR);
+            sizeout = ecdsaFinish(privkey, buffer);
+        } catch (CryptoException e) {
+            // e.g. R0 + t*G is the point at infinity
+            ISOException.throwIt(SW_ECDSA_NONCE_ERROR);
+        } finally {
+            Sha256.clear();
+            clearSigningScratch(buffer, sizeout, ECDSA_APDU_SIZE);
+        }
+        return sizeout;
+    }
+
+    /**
+     * Anti-exfil: loads h (from the stored z) and d, and derives k0 = RFC 6979(d, h, extra) into K,
+     * where extra is the 32-byte host commitment at commitment[commitmentOff].
+     * As in BIP461 sign(), the next output of the generator is taken while the nonce is not in [1, n-1].
+     */
+    private void antiexfilDeriveK0(ECPrivateKey privkey, byte[] commitment, short commitmentOff) {
+        Util.arrayCopyNonAtomic(antiexfil_state, ANTIEXFIL_OFFSET_Z, recvBuffer, ECDSA_OFFSET_H, (short)32);
+        reduceModOrder(recvBuffer, ECDSA_OFFSET_H);
+        privkey.getS(recvBuffer, ECDSA_OFFSET_D);
+        if (Biginteger.isZeroCT(recvBuffer, ECDSA_OFFSET_D, (short)32)
+                | !Biginteger.lessThanCT(recvBuffer, ECDSA_OFFSET_D, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32))
+            ISOException.throwIt(SW_INCORRECT_ALG);
+        Util.arrayCopyNonAtomic(commitment, commitmentOff, recvBuffer, ECDSA_OFFSET_X, (short)32);
+        rfc6979Seed(true);
+        for (short retry = (short)0; Biginteger.isZeroCT(recvBuffer, ECDSA_OFFSET_K, (short)32)
+                | !Biginteger.lessThanCT(recvBuffer, ECDSA_OFFSET_K, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32); retry++) {
+            if (retry >= ECDSA_RETRY_LIMIT)
+                ISOException.throwIt(SW_ECDSA_NONCE_ERROR);
+            rfc6979Next();
+        }
     }
 
     /** x = x mod n for a public 32-byte x: x < 2^256 < 2n, so n is subtracted at most once. */
@@ -2762,18 +3001,26 @@ public class Satochip extends javacard.framework.Applet {
      * extra is empty for counter 0, else the counter on 4 bytes little endian followed by 28 zeros.
      */
     private void rfc6979Init(short grind) {
-        Util.arrayFillNonAtomic(recvBuffer, ECDSA_OFFSET_HK, (short)32, (byte)0x00);
-        Util.arrayFillNonAtomic(recvBuffer, ECDSA_OFFSET_K, (short)32, (byte)0x01);
         Util.arrayFillNonAtomic(recvBuffer, ECDSA_OFFSET_X, (short)32, (byte)0x00);
         recvBuffer[ECDSA_OFFSET_X] = (byte)grind;
         recvBuffer[(short)(ECDSA_OFFSET_X+1)] = (byte)(grind >> 8);
+        rfc6979Seed(grind != (short)0);
+    }
+
+    /**
+     * The generator itself: seeds it with d, h and, if withExtra is set, the 32 bytes of extra
+     * data at X, and leaves the first nonce candidate in K (see rfc6979Init()).
+     */
+    private void rfc6979Seed(boolean withExtra) {
+        Util.arrayFillNonAtomic(recvBuffer, ECDSA_OFFSET_HK, (short)32, (byte)0x00);
+        Util.arrayFillNonAtomic(recvBuffer, ECDSA_OFFSET_K, (short)32, (byte)0x01);
         for (short i = (short)0; i < (short)2; i++) {
             HmacSha256.begin(recvBuffer, ECDSA_OFFSET_HK);
             HmacSha256.update(recvBuffer, ECDSA_OFFSET_K, (short)32);
             HmacSha256.update(ECDSA_RFC6979_SEPARATORS, i, (short)1);
             HmacSha256.update(recvBuffer, ECDSA_OFFSET_D, (short)32);
             HmacSha256.update(recvBuffer, ECDSA_OFFSET_H, (short)32);
-            if (grind != (short)0)
+            if (withExtra)
                 HmacSha256.update(recvBuffer, ECDSA_OFFSET_X, (short)32);
             HmacSha256.finish(recvBuffer, ECDSA_OFFSET_HK, recvBuffer, ECDSA_OFFSET_HK);
             rfc6979UpdateV();
@@ -2825,8 +3072,7 @@ public class Satochip extends javacard.framework.Applet {
 
     /**
      * R = k*G without handing k to the EC engine: Q = w*G for a fresh random w, then
-     * R = (k * w^-1) * Q. Leaves R at buffer[ECDSA_APDU_R] and reduces its x coordinate to
-     * r = x(R) mod n in place.
+     * R = (k * w^-1) * Q. Leaves the point R at buffer[ECDSA_APDU_R], uncompressed.
      */
     private void ecdsaComputeR(byte[] buffer) {
         // Q = w*G
@@ -2843,8 +3089,6 @@ public class Satochip extends javacard.framework.Applet {
         setEphemeralScalar(buffer, ECDSA_APDU_T);
         keyAgreement.init(ephemeral_privkey);
         keyAgreement.generateSecret(buffer, ECDSA_APDU_Q, (short)65, buffer, ECDSA_APDU_R);
-        // r = x(R) mod n
-        reduceModOrder(buffer, (short)(ECDSA_APDU_R+1));
     }
 
     /**

@@ -154,6 +154,59 @@ final class Bip461 {
     return out;
   }
 
+  // ---- anti-exfil (secp256k1-zkp ecdsa_s2c) ----------------------------------------------------
+
+  /** One line of antiexfil_vectors.csv, generated with secp256k1-zkp. */
+  static final class AntiExfilVector {
+    final byte[] seckey, msghash, rho, commitment, opening, sig;
+    AntiExfilVector(String[] f) {
+      seckey = Hex.decode(f[0]); msghash = Hex.decode(f[1]); rho = Hex.decode(f[2]);
+      commitment = Hex.decode(f[3]); opening = Hex.decode(f[4]); sig = Hex.decode(f[5]);
+    }
+  }
+
+  static List<AntiExfilVector> antiExfilVectors() throws Exception {
+    List<AntiExfilVector> out = new ArrayList<>();
+    try (InputStream in = Bip461.class.getResourceAsStream("antiexfil_vectors.csv")) {
+      if (in == null) throw new IllegalStateException("antiexfil_vectors.csv is not on the test classpath");
+      BufferedReader r = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8));
+      String line = r.readLine(); // header
+      while ((line = r.readLine()) != null) {
+        if (!line.isEmpty()) out.add(new AntiExfilVector(line.split(",")));
+      }
+    }
+    return out;
+  }
+
+  /** BIP340-style tagged hash: SHA256(SHA256(tag) | SHA256(tag) | msg). */
+  static byte[] taggedHash(String tag, byte[]... parts) throws Exception {
+    java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+    byte[] t = md.digest(tag.getBytes(StandardCharsets.US_ASCII));
+    md.update(t);
+    md.update(t);
+    for (byte[] p : parts) md.update(p);
+    return md.digest();
+  }
+
+  /** What the host sends first: its commitment to rho. */
+  static byte[] antiExfilCommitment(byte[] rho) throws Exception {
+    return taggedHash("s2c/ecdsa/data", rho);
+  }
+
+  /**
+   * The host's check of an anti-exfil signature (what secp256k1_anti_exfil_host_verify does on
+   * top of the ordinary verification): x(R0 + t*G) mod n must be r, with
+   * t = tagged_hash("s2c/ecdsa/point", R0 | rho).
+   */
+  static boolean antiExfilNonceCommitsTo(byte[] r0Compressed, byte[] rho, byte[] rs) throws Exception {
+    ECNamedCurveParameterSpec spec = ECNamedCurveTable.getParameterSpec("secp256k1");
+    BigInteger t = new BigInteger(1, taggedHash("s2c/ecdsa/point", r0Compressed, rho));
+    if (t.compareTo(N) >= 0) return false;
+    org.bouncycastle.math.ec.ECPoint r = spec.getCurve().decodePoint(r0Compressed).add(spec.getG().multiply(t)).normalize();
+    if (r.isInfinity()) return false;
+    return r.getAffineXCoord().toBigInteger().mod(N).equals(new BigInteger(1, Arrays.copyOfRange(rs, 0, 32)));
+  }
+
   static byte[] fixed32(BigInteger v) {
     byte[] raw = v.toByteArray();
     byte[] out = new byte[32];

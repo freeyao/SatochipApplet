@@ -74,6 +74,13 @@ public class EcdsaExposedAppletTest {
     SatochipTest.checkBip461Vectors(cmd, SLOT, VECTOR_COUNT);
   }
 
+  @Test
+  @DisplayName("Anti-exfil ECDSA matches secp256k1-zkp on the bytecode SHA-256 backend")
+  void antiExfilVectorsOnBytecodeSha256Test() throws Exception {
+    assertEquals(Sha256.BACKEND_BYTECODE, Sha256.getBackend());
+    SatochipTest.checkAntiExfilVectors(cmd, SLOT, 12);
+  }
+
   // ---- the signature check, called directly ---------------------------------------------------
 
   static final int SW_ECDSA_VERIFY_FAILED = 0x9C4D;

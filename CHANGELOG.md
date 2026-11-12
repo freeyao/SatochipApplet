@@ -8,6 +8,19 @@ Satochip applet full versions follows this format: vX.Y-Z.W where:
 * X.Y refers to the PROTOCOL VERSION: changes that impact compatibility with the client side (e.g new functionalities, major patch...)
 * Z.W refers to changes with no impact on compatibility of the client (e.g minor patches, optimizations...)
 
+## [0.18-0.1]
+
+### New features
+
+* **Anti-exfil ECDSA: SignTransactionHashAntiExfil (0x70).** A second way of signing a hash, in which the host contributes randomness to the nonce and can check for every signature that the card used it. It is the ECDSA Anti-Exfil protocol of [secp256k1-zkp](https://github.com/BlockstreamResearch/secp256k1-zkp) (module `ecdsa_s2c`, used by Jade and BitBox02), and the card's outputs are byte-identical to that library's:
+  * `P2=0x01` (OP_INIT), data `[hash(32) | host_commitment(32) | optional 2FA: flag(2) hmac(20)]`, where `host_commitment = tagged_hash("s2c/ecdsa/data", rho)` for a random 32-byte `rho` the host keeps. Returns the signer commitment `R0`, a 33-byte compressed point. With 2FA enabled the HMAC is the one of SignTransactionHash (over `hash | 0xCC*32`).
+  * `P2=0x03` (OP_FINALIZE), data `[rho(32)]`. Returns the DER signature, low-S. `P1` is the key number, the same in both steps.
+  * The host must check `x(R0 + t*G) mod n = r` with `t = tagged_hash("s2c/ecdsa/point", R0 | rho)` and verify the signature (`secp256k1_anti_exfil_host_verify` does both). If the card fails after returning `R0`, retry with the same `rho` and check that `R0` is the same.
+  * Each OP_FINALIZE consumes its OP_INIT. Status words: `0x9C13` no OP_INIT pending, `0x9C10` P1 differs from OP_INIT, `0x9C4F` (new) `rho` does not open the commitment, `0x9C4E` no usable nonce (not expected).
+  * There is no low-r grinding on this path: about half of the signatures have a 33-byte r. A host that wants low-r starts again with a new `rho`.
+  * Unlike secp256k1-zkp the card keeps the public values of the first step (hash, commitment, R0, key number) in RAM between the two commands, and computes `R = R0 + t*G` on public values: one secret scalar multiplication instead of three. The nonce is always re-derived from the commitment recomputed from `rho`, so a skipped comparison cannot pair one nonce with two different `rho`; the signature is verified on the card before it is output.
+  * SignTransactionHash (0x7A) is unchanged and remains the deterministic BIP461 path.
+
 ## [0.17-0.1]
 
 SignTransactionHash no longer uses the card's black-box ECDSA, and the three signatures that keys made of their own public key are gone. The protocol version becomes 0.17 because three response formats change.

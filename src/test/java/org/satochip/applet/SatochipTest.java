@@ -287,7 +287,7 @@ public class SatochipTest {
     byte[] s = cmdSet.cardGetStatus().getData();
     assertEquals(18, s.length, "GET_STATUS payload length");
     assertEquals(0x00, s[0], "protocol major version");
-    assertEquals(0x11, s[1], "protocol minor version (0.17)");
+    assertEquals(0x12, s[1], "protocol minor version (0.18)");
     assertEquals(5, s[4], "PIN tries remaining should be back at the maximum");
     assertEquals(0x01, s[10], "setup done");
     assertEquals(0x01, s[11], "secure channel is always enabled");
@@ -983,6 +983,112 @@ public class SatochipTest {
       assertEquals(SW_INCORRECT_P1,
           cmdSet.sendRawSecure(INS_SIGN_TRANSACTION_HASH, BIP461_SLOT, 0x00, hash).getSw(),
           "the slot must still be empty");
+    }
+  }
+
+  // ---- anti-exfil ECDSA ------------------------------------------------------------------------
+
+  static final byte INS_SIGN_TRANSACTION_HASH_ANTIEXFIL = (byte) 0x70;
+  static final int ANTIEXFIL_INIT = 0x01;
+  static final int ANTIEXFIL_FINALIZE = 0x03;
+  static final int SW_ECDSA_ANTIEXFIL_COMMITMENT = 0x9C4F;
+
+  /**
+   * Runs the anti-exfil protocol on the card for the first {@code count} vectors made with
+   * secp256k1-zkp: the signer commitment R0 and the signature must be byte-identical to the
+   * library's, and the host-side nonce check and the ordinary verification must pass.
+   */
+  static void checkAntiExfilVectors(TestSatochipCommandSet cmd, int slot, int count) throws Exception {
+    List<Bip461.AntiExfilVector> vectors = Bip461.antiExfilVectors();
+    assertTrue(vectors.size() >= count, "vector file too short");
+    ECNamedCurveParameterSpec spec = ECNamedCurveTable.getParameterSpec("secp256k1");
+    try {
+      for (int i = 0; i < count; i++) {
+        Bip461.AntiExfilVector v = vectors.get(i);
+        String id = "vector " + i;
+        assertArrayEquals(v.commitment, Bip461.antiExfilCommitment(v.rho), "host commitment, " + id);
+        assertEquals(SW_OK, importSlotKey(cmd, slot, v.seckey), "import, " + id);
+
+        APDUResponse init = cmd.sendRawSecure(INS_SIGN_TRANSACTION_HASH_ANTIEXFIL, slot, ANTIEXFIL_INIT,
+            concat(v.msghash, v.commitment));
+        assertEquals(SW_OK, init.getSw(), "init, " + id);
+        assertArrayEquals(v.opening, init.getData(), "signer commitment R0, " + id);
+
+        APDUResponse fin = cmd.sendRawSecure(INS_SIGN_TRANSACTION_HASH_ANTIEXFIL, slot, ANTIEXFIL_FINALIZE, v.rho);
+        assertEquals(SW_OK, fin.getSw(), "finalize, " + id);
+        byte[] rs = Bip461.parseStrictDer(fin.getData());
+        assertArrayEquals(v.sig, rs, "signature, " + id);
+        assertTrue(Bip461.isLowS(rs), "low-S, " + id);
+        // what a host does with the result
+        assertTrue(Bip461.antiExfilNonceCommitsTo(init.getData(), v.rho, rs), "x(R0 + t*G) = r, " + id);
+        byte[] pub = spec.getG().multiply(new java.math.BigInteger(1, v.seckey)).normalize().getEncoded(false);
+        byte[] h = Bip461.fixed32(new java.math.BigInteger(1, v.msghash)); // verified as an integer: no reduction needed
+        assertTrue(verifyEcdsa(pub, h, fin.getData()), "the signature verifies, " + id);
+
+        assertEquals(SW_OK, cmd.sendRawSecure(INS_RESET_KEY, slot, 0x00, new byte[0]).getSw(), "reset, " + id);
+      }
+    } finally {
+      cmd.sendRawSecure(INS_RESET_KEY, slot, 0x00, new byte[0]); // no-op when the loop completed
+    }
+  }
+
+  @Test
+  @DisplayName("Anti-exfil ECDSA is byte-identical to secp256k1-zkp (commitment R0 and signature)")
+  void signAntiExfilVectorsTest() throws Exception {
+    checkAntiExfilVectors(cmdSet, BIP461_SLOT, TARGET == TARGET_SIMULATOR ? Bip461.antiExfilVectors().size() : 4);
+  }
+
+  @Test
+  @DisplayName("Anti-exfil ECDSA: one FINALIZE per INIT, the revealed randomness must match, PIN required")
+  void signAntiExfilRulesTest() throws Exception {
+    final int SW_WRONG_LENGTH = 0x6700;
+    final int SW_INCORRECT_INITIALIZATION = 0x9C13;
+    Bip461.AntiExfilVector v = Bip461.antiExfilVectors().get(5);
+    byte[] initData = concat(v.msghash, v.commitment);
+    byte ins = INS_SIGN_TRANSACTION_HASH_ANTIEXFIL;
+    assertEquals(SW_OK, importSlotKey(cmdSet, BIP461_SLOT, v.seckey));
+    try {
+      // nothing pending
+      assertEquals(SW_INCORRECT_INITIALIZATION, cmdSet.sendRawSecure(ins, BIP461_SLOT, ANTIEXFIL_FINALIZE, v.rho).getSw());
+      // malformed commands
+      assertEquals(SW_INCORRECT_P2, cmdSet.sendRawSecure(ins, BIP461_SLOT, 0x02, initData).getSw());
+      assertEquals(SW_WRONG_LENGTH, cmdSet.sendRawSecure(ins, BIP461_SLOT, ANTIEXFIL_INIT, v.msghash).getSw(),
+          "the host commitment is mandatory");
+      assertEquals(SW_INCORRECT_P1, cmdSet.sendRawSecure(ins, BIP461_SLOT - 1, ANTIEXFIL_INIT, initData).getSw(),
+          "empty keyslot");
+
+      // the first step is deterministic: a host that retries gets the same R0
+      APDUResponse init = cmdSet.sendRawSecure(ins, BIP461_SLOT, ANTIEXFIL_INIT, initData);
+      assertEquals(SW_OK, init.getSw());
+      assertArrayEquals(init.getData(), cmdSet.sendRawSecure(ins, BIP461_SLOT, ANTIEXFIL_INIT, initData).getData());
+
+      // a rho that does not open the commitment is refused, and consumes the pending step
+      byte[] otherRho = v.rho.clone();
+      otherRho[7] ^= 0x01;
+      assertEquals(SW_ECDSA_ANTIEXFIL_COMMITMENT, cmdSet.sendRawSecure(ins, BIP461_SLOT, ANTIEXFIL_FINALIZE, otherRho).getSw());
+      assertEquals(SW_INCORRECT_INITIALIZATION, cmdSet.sendRawSecure(ins, BIP461_SLOT, ANTIEXFIL_FINALIZE, v.rho).getSw(),
+          "a refused FINALIZE must not leave the INIT usable");
+
+      // FINALIZE with another key number than INIT
+      assertEquals(SW_OK, cmdSet.sendRawSecure(ins, BIP461_SLOT, ANTIEXFIL_INIT, initData).getSw());
+      assertEquals(SW_INCORRECT_P1, cmdSet.sendRawSecure(ins, 0xFF, ANTIEXFIL_FINALIZE, v.rho).getSw());
+      assertEquals(SW_INCORRECT_INITIALIZATION, cmdSet.sendRawSecure(ins, BIP461_SLOT, ANTIEXFIL_FINALIZE, v.rho).getSw());
+
+      // a complete run, then no second signature from the same INIT
+      assertEquals(SW_OK, cmdSet.sendRawSecure(ins, BIP461_SLOT, ANTIEXFIL_INIT, initData).getSw());
+      APDUResponse fin = cmdSet.sendRawSecure(ins, BIP461_SLOT, ANTIEXFIL_FINALIZE, v.rho);
+      assertEquals(SW_OK, fin.getSw());
+      assertArrayEquals(v.sig, Bip461.parseStrictDer(fin.getData()));
+      assertEquals(SW_INCORRECT_INITIALIZATION, cmdSet.sendRawSecure(ins, BIP461_SLOT, ANTIEXFIL_FINALIZE, v.rho).getSw());
+
+      // both steps need the PIN: a new secure channel logs it out
+      assertEquals(SW_OK, cmdSet.sendRawSecure(ins, BIP461_SLOT, ANTIEXFIL_INIT, initData).getSw());
+      cmdSet.forgetSecureChannel();
+      assertEquals(SW_UNAUTHORIZED, cmdSet.sendRawSecure(ins, BIP461_SLOT, ANTIEXFIL_FINALIZE, v.rho).getSw());
+      assertEquals(SW_UNAUTHORIZED, cmdSet.sendRawSecure(ins, BIP461_SLOT, ANTIEXFIL_INIT, initData).getSw());
+    } finally {
+      resetSession();
+      cmdSet.sendRawSecure(INS_RESET_KEY, BIP461_SLOT, 0x00, new byte[0]);
     }
   }
 
