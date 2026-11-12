@@ -54,6 +54,9 @@ jobs:
       - name: Test against the JCardEngine simulator
         run: ./gradlew --no-daemon test -Porg.satochip.test.target=simulator
 
+      - name: Benchmark harness on the simulator (scratch branch only)
+        run: ./gradlew --no-daemon benchmarkCard -Porg.satochip.test.target=simulator -Porg.satochip.bench.iterations=5 -Porg.satochip.bench.warmup=1
+
       - name: Upload test report
         if: always()
         uses: actions/upload-artifact@v4
