@@ -287,7 +287,7 @@ public class SatochipTest {
     byte[] s = cmdSet.cardGetStatus().getData();
     assertEquals(18, s.length, "GET_STATUS payload length");
     assertEquals(0x00, s[0], "protocol major version");
-    assertEquals(0x10, s[1], "protocol minor version (0.16)");
+    assertEquals(0x11, s[1], "protocol minor version (0.17)");
     assertEquals(5, s[4], "PIN tries remaining should be back at the maximum");
     assertEquals(0x01, s[10], "setup done");
     assertEquals(0x01, s[11], "secure channel is always enabled");
