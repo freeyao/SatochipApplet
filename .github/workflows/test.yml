@@ -23,7 +23,12 @@ jobs:
         shell: cmd
         run: |
           set JC_HOME=%CD%\sdks\jc305u3_kit
-          call sdks\jc305u3_kit\bin\scriptgen.bat -o cap.scr build\javacard\org\satochip\applet\javacard\applet.cap
+          set EXP=%JC_HOME%\api_export_files
+          call sdks\jc305u3_kit\bin\verifycap.bat -help
+          dir /s /b "%EXP%\*.exp" | findstr /i "java\\lang javacard\\framework javacard\\security javacardx\\crypto"
+          call sdks\jc305u3_kit\bin\verifycap.bat -nobanner -outfile applet.hash "%EXP%\java\lang\javacard\lang.exp" "%EXP%\javacard\framework\javacard\framework.exp" "%EXP%\javacard\security\javacard\security.exp" "%EXP%\javacardx\crypto\javacard\crypto.exp" build\javacard\org\satochip\applet\javacard\applet.cap
+          dir applet.hash
+          call sdks\jc305u3_kit\bin\scriptgen.bat -nobanner -nobeginend -hashfile applet.hash -o cap.scr build\javacard\org\satochip\applet\javacard\applet.cap
           dir cap.scr
       - name: Assemble the APDU script
         shell: bash
