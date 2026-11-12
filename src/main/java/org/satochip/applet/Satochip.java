@@ -112,8 +112,9 @@ public class Satochip extends javacard.framework.Applet {
     // 0.15-0.0: add MuSig2 support (beta dev)
     // 0.15-0.1: MuSig2 support (beta): add mechanism to ensure that the BIP327 encrypted secnonce cannot be reused.
     // 0.16-0.1: security fixes & hardening (ResetKey 2FA HMAC fix, EC point validation, Musig2SignHash 2FA fix, MuSig2 nonce counter overflow fix, resetToFactory completion, BIP341 taproot tweak fix, ImportKey hardening, constant-time MAC comparisons, reset-to-factory refactoring, authentikey mgmt, transient AES session keys, removal of ParseTransaction/SignTransaction/signMessage, add GET_RANDOM, single PIN/PUK mgmt, ...)
+    // 0.17-0.1: self-built ECDSA for SignTransactionHash (BIP461: RFC 6979 nonce, low-r, low-S, verified before output) instead of the platform Signature engine; the three self-signatures are removed and the full public key is returned instead (getBIP32ExtendedKey, getPublicKeyFromPrivate, InitiateSecureChannel: new response formats)
     private final static byte PROTOCOL_MAJOR_VERSION = (byte) 0; 
-    private final static byte PROTOCOL_MINOR_VERSION = (byte) 16;
+    private final static byte PROTOCOL_MINOR_VERSION = (byte) 17;
     private final static byte APPLET_MAJOR_VERSION = (byte) 0;
     private final static byte APPLET_MINOR_VERSION = (byte) 1;
 
@@ -1759,7 +1760,12 @@ public class Satochip extends javacard.framework.Applet {
      * p1: private key number (0x00-0x0F)
      * p2: 0x00
      * data: none 
-     * return(SECP256K1): [coordx_size(2b) | pubkey_coordx | sig_size(2b) | sig]
+     * return(SECP256K1): [pubkey_size(2b)=65 | pubkey(65b)]
+     *      pubkey is the uncompressed public key [0x04 | x(32b) | y(32b)]
+     *
+     * Up to protocol v0.16 the response was [coordx_size(2b) | coordx(32b) | sig_size(2b) | sig],
+     * the x coordinate signed by the key itself so that the client could recover y from the
+     * signature. The card returns the full point since v0.17 and the key signs nothing here.
      */
     private short getPublicKeyFromPrivate(APDU apdu, byte[] buffer) {
         // check that PIN has been entered previously
@@ -1773,19 +1779,10 @@ public class Satochip extends javacard.framework.Applet {
         
         ECPrivateKey key = getInitializedECKey(key_nb);
                 
-        // compute the corresponding partial public key...
-        getPublicKey(key, buffer, (short)1); // uncompressed pubkey (65b)
-        Util.setShort(buffer, (short)0, BIP32_KEY_SIZE);
-        
-        // sign fixed message
-        sigECDSA.init(key, Signature.MODE_SIGN);
-        short sign_size= sigECDSA.sign(buffer, (short)0, (short)(BIP32_KEY_SIZE+2), buffer, (short)(BIP32_KEY_SIZE+4));
-        Util.setShort(buffer, (short)(BIP32_KEY_SIZE+2), sign_size);
-        
-        // return x-coordinate of public key+signature
-        // the client can recover full public-key from the signature or
-        // by guessing the compression value () and verifying the signature... 
-        return (short)(2+BIP32_KEY_SIZE+2+sign_size);
+        // return the full public key
+        short pubkey_size = getPublicKey(key, buffer, (short)2); // uncompressed pubkey (65b)
+        Util.setShort(buffer, (short)0, pubkey_size);
+        return (short)(2+pubkey_size);
     }       
 
     /** 
@@ -2384,8 +2381,8 @@ public class Satochip extends javacard.framework.Applet {
     }
     
     /**
-     * The function computes the Bip32 extended key derived from the master key and returns either the 
-     * 32-bytes x-coordinate of the public key, or the 32-bytes private key, signed by the authentikey.
+     * The function computes the Bip32 extended key derived from the master key and returns its
+     * chaincode and its uncompressed public key, signed by the authentikey.
      *
      * The Path for the derivation is provided in the apdu data.
      *
@@ -2398,7 +2395,15 @@ public class Satochip extends javacard.framework.Applet {
      * data: [path_bytes(4*depth)] where:
      *      path_bytes is the index path from master to extended key (m/i/j/k/...). 4 bytes per index
      *
-     * returns: [chaincode(32b) | coordx_size(2b) | coordx | sig_size(2b) | self-sig | sig_size(2b) | authentikey-sig]
+     * returns: [chaincode(32b) | pubkey_size(2b)=65 | pubkey(65b) | sig_size(2b) | authentikey-sig]
+     *      pubkey is the uncompressed public key [0x04 | x(32b) | y(32b)]
+     *      authentikey-sig is the authentikey signature of all the bytes before it (chaincode,
+     *      pubkey_size and pubkey)
+     *
+     * Up to protocol v0.16 the response was [chaincode(32b) | coordx_size(2b) | coordx(32b) |
+     * sig_size(2b) | self-sig | sig_size(2b) | authentikey-sig]: the x coordinate only, signed by
+     * the derived key itself so that the client could recover y from that signature. The card
+     * returns the full point since v0.17, so the derived key signs nothing here anymore.
      *
      **/
     private short getBIP32ExtendedKey(APDU apdu, byte[] buffer){
@@ -2483,19 +2488,13 @@ public class Satochip extends javacard.framework.Applet {
         Util.arrayCopyNonAtomic(recvBuffer, BIP32_OFFSET_PARENT_CHAINCODE, buffer, (short)0, BIP32_KEY_SIZE);
         Util.arrayFillNonAtomic(recvBuffer, BIP32_OFFSET_PARENT_CHAINCODE, BIP32_OFFSET_END, (byte)0);
 
-        // compute the corresponding partial public key...
-        getPublicKey(bip32_extendedkey, buffer, (short)33); // uncompressed pubkey (65b)
-        Util.setShort(buffer, BIP32_KEY_SIZE, BIP32_KEY_SIZE);
+        // the full public key of the extended key: no signature by the key itself is needed to recover it
+        short pubkey_size = getPublicKey(bip32_extendedkey, buffer, (short)(BIP32_KEY_SIZE+2)); // uncompressed pubkey (65b)
+        Util.setShort(buffer, BIP32_KEY_SIZE, pubkey_size);
 
-        // self-sign coordx
-        sigECDSA.init(bip32_extendedkey, Signature.MODE_SIGN);
-        short sign_size= sigECDSA.sign(buffer, (short)0, (short)(BIP32_KEY_SIZE+2+BIP32_KEY_SIZE), buffer, (short)(BIP32_KEY_SIZE+BIP32_KEY_SIZE+4));
-        Util.setShort(buffer, (short)(BIP32_KEY_SIZE+BIP32_KEY_SIZE+2), sign_size);
-
-        // return x-coordinate of public key+signatures, signed by the authentikey
-        // the client can recover full public-key by guessing the compression value () and verifying the signature... 
-        // buffer=[chaincode(32) | coordx_size(2) | coordx | sign_size(2) | self-sign | sign_size(2) | auth_sign]
-        return appendAuthentikeySignature(buffer, (short)(BIP32_KEY_SIZE+BIP32_KEY_SIZE+sign_size+4));
+        // return the chaincode and the public key, signed by the authentikey
+        // buffer=[chaincode(32) | pubkey_size(2) | pubkey(65) | sign_size(2) | auth_sign]
+        return appendAuthentikeySignature(buffer, (short)(BIP32_KEY_SIZE+2+pubkey_size));
 
     }// end of getBip32ExtendedKey()
     

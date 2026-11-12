@@ -18,7 +18,7 @@ Main features (see `CHANGELOG.md` for the full history):
 - PIN/PUK access control, optional 2FA (HMAC-SHA1 challenge via an external device), mandatory secure channel, SeedKeeper secure seed import, personalization PKI, NFC policy and feature policy (features can be enabled/disabled/blocked).
 - Reset to factory settings.
 
-**Versioning** (`CHANGELOG.md`, constants in `Satochip.java`): full versions are `vX.Y-Z.W` where `X.Y` is the PROTOCOL VERSION (client-compatibility impacting) and `Z.W` the applet version (no client impact). Current version: **0.16-0.0** (work in progress).
+**Versioning** (`CHANGELOG.md`, constants in `Satochip.java`): full versions are `vX.Y-Z.W` where `X.Y` is the PROTOCOL VERSION (client-compatibility impacting) and `Z.W` the applet version (no client impact). Current version: **0.17-0.1** (work in progress).
 
 ## Repository layout
 

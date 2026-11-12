@@ -8,6 +8,46 @@ Satochip applet full versions follows this format: vX.Y-Z.W where:
 * X.Y refers to the PROTOCOL VERSION: changes that impact compatibility with the client side (e.g new functionalities, major patch...)
 * Z.W refers to changes with no impact on compatibility of the client (e.g minor patches, optimizations...)
 
+## [0.17-0.1]
+
+SignTransactionHash no longer uses the card's black-box ECDSA, and the three signatures that keys made of their own public key are gone. The protocol version becomes 0.17 because three response formats change.
+
+### Breaking changes (summary)
+
+* **getBIP32ExtendedKey (0x6D), getPublicKeyFromPrivate (0x35), InitiateSecureChannel (0x81):** the card returns the full uncompressed public key instead of an x coordinate and a self-signature. Clients must parse the new formats; see *Removed* for the byte layouts and what to change.
+* **Installation** is refused with `SW_UNSUPPORTED_FEATURE` (0x9C05) on a card without the RSA squaring, the RSA exponentiation used for modular inversion, or `ALG_EC_PACE_GM`. Such a card could not sign.
+
+### New features
+
+* **Self-built ECDSA for SignTransactionHash (0x7A).** The signature is assembled by the applet as specified in [BIP461](https://github.com/bitcoin/bips/blob/master/bip-0461.md) instead of being produced by `Signature.ALG_ECDSA_SHA_256`, whose nonce cannot be observed or checked:
+  * the nonce is the RFC 6979 nonce (HMAC-SHA256 of the private key and the hash, no extra entropy); r is ground to low-r (the derivation is restarted with a counter while r >= 2^255) and s is normalized to low-S;
+  * the signature is deterministic and is the one libsecp256k1 / Bitcoin Core produce, so a card can be cross-checked against another signer holding the same key. The card's random generator does not enter the signature;
+  * the signature is verified on the card (u1\*G + u2\*P) before it is returned. If it does not verify, `0x9C4D` is returned and nothing is output;
+  * the platform engines never receive the nonce or the private key: R = k\*G is computed as (k\*w^-1)\*(w\*G) for a random w, k^-1 is obtained from the inverse of k\*b for a random b, and the multiplications use operands blinded with a random multiple of n.
+  * Command and response format are unchanged (DER). Signatures are at most 70 bytes; the client-side low-S normalization is no longer needed. New status words: `0x9C4D` (the signature did not verify) and `0x9C4E` (no acceptable nonce within 64 grinding attempts, probability 2^-64).
+  * A signature now takes several RSA and EC operations instead of one, and the time varies with the number of grinding attempts. Timings on a card: to be measured (`./gradlew benchmarkCard`).
+* **SHA-256 backend selected at install** for the nonce derivation: the platform MessageDigest (default) or an implementation in JavaCard bytecode, with which the private key and the nonce do not enter a platform primitive at all. Select the bytecode backend with install data `01` (`gp --install applet.cap --params 01`, or `./gradlew install -Porg.satochip.install.params=01`). The signatures are the same with both.
+
+### Removed
+
+* **The three self-signatures.** They let a client recover the y coordinate of a public key from its x coordinate and a signature made by that key. The card computes full points (it already returns one in TaprootTweakPrivateKey), so it now returns them, and three uses of the platform ECDSA with a wallet or ephemeral private key disappear. The authentikey signatures are unchanged.
+
+  | Command | Up to v0.16 | From v0.17 |
+  | --- | --- | --- |
+  | getBIP32ExtendedKey (0x6D) | `[chaincode(32) \| coordx_size(2) \| coordx(32) \| sig_size(2) \| self-sig \| sig_size(2) \| authentikey-sig]` | `[chaincode(32) \| pubkey_size(2)=65 \| pubkey(65) \| sig_size(2) \| authentikey-sig]` |
+  | getPublicKeyFromPrivate (0x35) | `[coordx_size(2) \| coordx(32) \| sig_size(2) \| self-sig]` | `[pubkey_size(2)=65 \| pubkey(65)]` |
+  | InitiateSecureChannel (0x81) | `[coordx_size(2) \| coordx(32) \| sig_size(2) \| self-sig \| sig_size(2) \| authentikey-sig \| coordx_size(2) \| authentikey_coordx(32)]` | `[pubkey_size(2)=65 \| pubkey(65) \| sig_size(2) \| authentikey-sig \| coordx_size(2) \| authentikey_coordx(32)]` |
+
+  `pubkey` is the uncompressed point `04 | x | y`. The authentikey signature covers every byte before its size field, as before.
+
+  What a client has to change: read the 2-byte size (65) and take the public key as is, instead of running ECDSA public key recovery on the self-signature; verify the authentikey signature over the new prefix (`chaincode | 0041 | pubkey` for 0x6D, `0041 | pubkey` for 0x81). A client can tell the formats apart by the size field (32 before, 65 now) or by the protocol version in GetStatus. Satochip-Java up to 0.3.6 and pysatochip parse the old formats only.
+
+### Tests
+
+* BIP461 signing vectors (the official ones and 300 generated with the BIP's reference implementation) compared byte for byte, on both SHA-256 backends; the signature check is exercised with altered signatures.
+* The suite parses the new response formats with its own `TestSatochipParser`, since the Satochip-Java release it depends on reads the old ones.
+* On the simulator the Schnorr, MuSig2 and curve-check tests now run: `Biginteger.init()` probes a second form of the RSA squaring that BouncyCastle accepts.
+
 ## [0.16-0.1]
 
 Security fixes and hardening patches following a security code review of the applet.

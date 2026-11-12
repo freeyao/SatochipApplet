@@ -136,7 +136,14 @@ class SecureChannel {
      *  p1: 0x00
      *  p2: 0x00
      *  data: [client-pubkey(65b)]
-     *  return: [coordx_size(2b) | ephemeralkey_coordx | sig_size(2b) | self_sig | sig2_size(2b) | authentikey_sig | coordx_size(2b) | authentikey_coordx]
+     *  return: [pubkey_size(2b)=65 | ephemeralkey_pubkey(65b) | sig_size(2b) | authentikey_sig | coordx_size(2b) | authentikey_coordx]
+     *      ephemeralkey_pubkey is the card's uncompressed ephemeral public key [0x04 | x(32b) | y(32b)]
+     *      authentikey_sig is the authentikey signature of the bytes before it (pubkey_size and pubkey)
+     *
+     *  Up to protocol v0.16 the response was [coordx_size(2b) | ephemeralkey_coordx | sig_size(2b) |
+     *  self_sig | sig2_size(2b) | authentikey_sig | coordx_size(2b) | authentikey_coordx]: the x
+     *  coordinate only, signed by the ephemeral key itself so that the client could recover y from
+     *  that signature. The card returns the full point since v0.17, so the ephemeral key signs nothing.
      */
     short initiate(byte[] buffer){
 
@@ -175,12 +182,9 @@ class SecureChannel {
             //reset IV counter
             Util.arrayFillNonAtomic(sc_buffer, OFFSET_SC_IV, SIZE_SC_IV, (byte) 0);
 
-            // self signed ephemeral pubkey
-            keyAgreement.generateSecret(Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_G, (short) 65, buffer, (short)1); //pubkey in uncompressed form
-            Util.setShort(buffer, (short)0, COORD_SIZE);
-            sigECDSA.init(ephemeral_privkey, Signature.MODE_SIGN);
-            short sign_size= sigECDSA.sign(buffer, (short)0, (short)(COORD_SIZE+2), buffer, (short)(COORD_SIZE+4));
-            Util.setShort(buffer, (short)(COORD_SIZE+2), sign_size);
+            // the ephemeral public key, in full (uncompressed form)
+            short pubkey_size = keyAgreement.generateSecret(Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_G, (short) 65, buffer, (short)2);
+            Util.setShort(buffer, (short)0, pubkey_size);
             // the ephemeral private key is not needed anymore (forward secrecy within the card
             // session). A persistent fallback key keeps its value: clearKey() would also erase the
             // curve parameters, which are only set again for transient keys.
@@ -188,8 +192,8 @@ class SecureChannel {
                 ephemeral_privkey.clearKey();
             }
 
-            // hash signed by authentikey
-            short offset= (short)(2+COORD_SIZE+2+sign_size);
+            // signed by the authentikey
+            short offset= (short)(2+pubkey_size);
             sigECDSA.init(authentikey_private, Signature.MODE_SIGN);
             short sign2_size= sigECDSA.sign(buffer, (short)0, offset, buffer, (short)(offset+2));
             Util.setShort(buffer, offset, sign2_size);
@@ -202,10 +206,7 @@ class SecureChannel {
 
             opened = true;
 
-            // return x-coordinate of public key+signature
-            // the client can recover full public-key from the signature or
-            // by guessing the compression value () and verifying the signature...
-            // buffer= [coordx_size(2b) | ephemeralkey_coordx | sig_size(2b) | self_sig | sig2_size | authentikey_sig | coordx_size(2b) | authentikey_coordx]
+            // buffer= [pubkey_size(2b) | ephemeralkey_pubkey(65b) | sig_size(2b) | authentikey_sig | coordx_size(2b) | authentikey_coordx]
             return offset;
         } finally {
             if (!opened)

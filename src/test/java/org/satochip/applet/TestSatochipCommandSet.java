@@ -28,6 +28,15 @@ public class TestSatochipCommandSet extends SatochipCommandSet {
   public TestSatochipCommandSet(CardChannel apduChannel) {
     super(apduChannel);
     this.channel = apduChannel;
+    // The SDK parser only knows the response formats up to applet v0.16 (public keys recovered
+    // from self-signatures). Swap in the parser of the v0.17 formats; the field is private.
+    try {
+      Field f = SatochipCommandSet.class.getDeclaredField("parser");
+      f.setAccessible(true);
+      f.set(this, new TestSatochipParser());
+    } catch (ReflectiveOperationException e) {
+      throw new IllegalStateException("Cannot replace the SDK parser", e);
+    }
   }
 
   /**

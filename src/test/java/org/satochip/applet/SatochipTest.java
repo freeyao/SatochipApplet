@@ -1364,6 +1364,70 @@ public class SatochipTest {
   }
 
   @Test
+  @DisplayName("Public keys are returned in full, without self-signature (0x6D, 0x35, 0x81)")
+  void fullPublicKeyResponsesTest() throws Exception {
+    final byte INS_GET_PUBLIC_FROM_PRIVATE = (byte) 0x35;
+    final byte INS_INIT_SECURE_CHANNEL = (byte) 0x81;
+    ECNamedCurveParameterSpec spec = ECNamedCurveTable.getParameterSpec("secp256k1");
+    byte[] authentikey = cmdSet.cardGetAuthentikey();
+    assertEquals(65, authentikey.length);
+
+    // --- getBIP32ExtendedKey: [chaincode(32) | 0x0041 | pubkey(65) | sig_size(2) | authentikey-sig]
+    DeterministicKey expected = HDKeyDerivation.createMasterPrivateKey(Vectors.BIP32_SEED);
+    for (ChildNumber c : new ChildNumber[]{new ChildNumber(44, true), new ChildNumber(0, true), new ChildNumber(7, false)}) {
+      expected = HDKeyDerivation.deriveChildKey(expected, c);
+    }
+    byte[] path = {(byte) 0x80, 0, 0, 44, (byte) 0x80, 0, 0, 0, 0, 0, 0, 7};
+    APDUResponse r = cmdSet.sendRawSecure(INS_BIP32_GET_EXTENDED_KEY, 3, 0x40, path);
+    assertEquals(SW_OK, r.getSw());
+    byte[] data = r.getData();
+    assertArrayEquals(expected.getChainCode(), Arrays.copyOfRange(data, 0, 32), "chaincode");
+    assertArrayEquals(new byte[]{0x00, 0x41}, Arrays.copyOfRange(data, 32, 34), "pubkey_size");
+    assertArrayEquals(expected.getPubKeyPoint().getEncoded(false), Arrays.copyOfRange(data, 34, 99),
+        "the full uncompressed public key");
+    int sigSize = ((data[99] & 0xff) << 8) | (data[100] & 0xff);
+    assertEquals(101 + sigSize, data.length, "nothing but the authentikey signature follows the public key");
+    assertTrue(verifyEcdsaSha256(authentikey, Arrays.copyOfRange(data, 0, 99), Arrays.copyOfRange(data, 101, data.length)),
+        "the authentikey signs [chaincode | pubkey_size | pubkey]");
+
+    // --- getPublicKeyFromPrivate: [0x0041 | pubkey(65)]
+    byte[] slotPub = spec.getG().multiply(new java.math.BigInteger(1, SLOT_PRIVKEY)).normalize().getEncoded(false);
+    assertEquals(SW_OK, importSlotKey(cmdSet, BIP461_SLOT, SLOT_PRIVKEY));
+    try {
+      r = cmdSet.sendRawSecure(INS_GET_PUBLIC_FROM_PRIVATE, BIP461_SLOT, 0x00, new byte[0]);
+      assertEquals(SW_OK, r.getSw());
+      assertArrayEquals(concat(new byte[]{0x00, 0x41}, slotPub), r.getData(),
+          "the full uncompressed public key and nothing else");
+    } finally {
+      cmdSet.sendRawSecure(INS_RESET_KEY, BIP461_SLOT, 0x00, new byte[0]);
+    }
+
+    // --- InitiateSecureChannel:
+    //     [0x0041 | pubkey(65) | sig_size(2) | authentikey-sig | 0x0020 | authentikey_coordx(32)]
+    byte[] clientPoint = spec.getG().multiply(new java.math.BigInteger(1, sha256("client key".getBytes())))
+        .normalize().getEncoded(false);
+    try {
+      r = cmdSet.sendRawPlain(INS_INIT_SECURE_CHANNEL, 0x00, 0x00, clientPoint);
+      assertEquals(SW_OK, r.getSw());
+      data = r.getData();
+      assertArrayEquals(new byte[]{0x00, 0x41}, Arrays.copyOfRange(data, 0, 2), "pubkey_size");
+      // decodePoint() checks that the point is on the curve
+      ECPoint cardPoint = spec.getCurve().decodePoint(Arrays.copyOfRange(data, 2, 67));
+      assertTrue(cardPoint.isValid() && data[2] == 0x04, "an uncompressed point on secp256k1");
+      sigSize = ((data[67] & 0xff) << 8) | (data[68] & 0xff);
+      assertTrue(verifyEcdsaSha256(authentikey, Arrays.copyOfRange(data, 0, 67), Arrays.copyOfRange(data, 69, 69 + sigSize)),
+          "the authentikey signs [pubkey_size | pubkey]");
+      int offset = 69 + sigSize;
+      assertArrayEquals(new byte[]{0x00, 0x20}, Arrays.copyOfRange(data, offset, offset + 2), "coordx_size");
+      assertArrayEquals(Arrays.copyOfRange(authentikey, 1, 33), Arrays.copyOfRange(data, offset + 2, offset + 34),
+          "authentikey x coordinate");
+      assertEquals(offset + 34, data.length, "no self-signature, no trailing bytes");
+    } finally {
+      resetSession(); // the raw INIT replaced the session key on the card
+    }
+  }
+
+  @Test
   @DisplayName("Keyslot commands reject out-of-range keyslots, including 0xFF")
   void keyslotRangeTest() {
     final byte INS_GET_PUBLIC_FROM_PRIVATE = (byte) 0x35;
@@ -1597,6 +1661,12 @@ public class SatochipTest {
   private static javax.smartcardio.ResponseAPDU transmitLe(int cla, int ins, int p1, int p2, int le)
       throws Exception {
     return rawChannel.transmit(new javax.smartcardio.CommandAPDU(cla, ins, p1, p2, le));
+  }
+
+  /** Verifies an ECDSA signature of SHA-256(message), as made by the card's Signature.ALG_ECDSA_SHA_256. */
+  private static boolean verifyEcdsaSha256(byte[] uncompressedPubkey, byte[] message, byte[] derSignature)
+      throws Exception {
+    return verifyEcdsa(uncompressedPubkey, sha256(message), derSignature);
   }
 
   private static boolean verifyEcdsa(byte[] uncompressedPubkey, byte[] hash, byte[] derSignature)
