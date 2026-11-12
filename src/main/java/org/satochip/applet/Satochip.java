@@ -306,6 +306,8 @@ public class Satochip extends javacard.framework.Applet {
     /** Taproot very low probability error*/
     private final static short SW_TAPROOT_TWEAK_ERROR = (short) 0x9C43;
     private final static short SW_SCHNORR_INVALID_NONCE = (short) 0x9C4C;
+    /** Self-built ECDSA: the signature just computed does not verify (computation error or fault injection): nothing is returned */
+    private final static short SW_ECDSA_VERIFY_FAILED = (short) 0x9C4D;
     /** Self-built ECDSA: no acceptable nonce was found within the attempt limits (not expected to happen) */
     private final static short SW_ECDSA_NONCE_ERROR = (short) 0x9C4E;
 
@@ -2551,6 +2553,8 @@ public class Satochip extends javacard.framework.Applet {
      *   The signature is therefore deterministic: the same key and hash always give the same
      *   bytes, which are those libsecp256k1 / Bitcoin Core produce. The client has nothing left
      *   to normalize. r and s are at most 32 bytes each, so the signature is at most 70 bytes.
+     *   The card verifies the signature against the public key before returning it: if it does
+     *   not verify, SW_ECDSA_VERIFY_FAILED (0x9C4D) is returned and no signature byte is output.
      *
      */
     private short SignTransactionHash(APDU apdu, byte[] buffer){
@@ -2629,6 +2633,8 @@ public class Satochip extends javacard.framework.Applet {
      *   [130..194) INV    in/out block of the inversion engine, value in its last 32 bytes
      *   [194..226) T      k', then h + r*d, then s
      *   [226..258) V      v, later u1
+     * During the verification (public values only) recvBuffer is reused: X holds u2,
+     * [0..65) the point u2*P and [96..161) the point u1*G + u2*P.
      * tmpBuffer: scratch of blindScalar() [0..222) and of HmacSha256 [0..96), never both at once.
      */
     private static final short ECDSA_OFFSET_ACC = (short)0;
@@ -2722,6 +2728,10 @@ public class Satochip extends javacard.framework.Applet {
             Biginteger.subtract(recvBuffer, ECDSA_OFFSET_ACC, buffer, ECDSA_APDU_T, (short)32);
             if (Biginteger.lessThan(recvBuffer, ECDSA_OFFSET_ACC, buffer, ECDSA_APDU_T, (short)32))
                 Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_ACC, buffer, ECDSA_APDU_T, (short)32);
+
+            // check the signature before any byte of it leaves the card
+            ecdsaVerify(privkey, buffer);
+
             // DER: 30 len 02 len(r) r 02 len(s) s, built aside since it overlaps r in the APDU buffer
             short offset = (short)(ECDSA_OFFSET_ACC+2);
             offset = derInteger(buffer, (short)(ECDSA_APDU_R+1), recvBuffer, offset);
@@ -2861,6 +2871,71 @@ public class Satochip extends javacard.framework.Applet {
         // s = u^-1 * v mod n, with v blinded
         mulModOrder(buffer, (short)(ECDSA_APDU_INV+32), buffer, ECDSA_APDU_V);
         Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_PRODUCT, buffer, ECDSA_APDU_T, (short)32);
+    }
+
+    /**
+     * recvBuffer[ECDSA_OFFSET_PRODUCT..+32) = a * x mod n for two public 32-byte values: same as
+     * mulModOrder(), without the blinding (half the RSA operations).
+     */
+    private void mulModOrderPublic(byte[] a, short aOff, byte[] x, short xOff) {
+        Util.arrayFillNonAtomic(tmpBuffer, BLIND_OFFSET_X, BLIND_PADDING, (byte)0);
+        Util.arrayCopyNonAtomic(x, xOff, tmpBuffer, (short)(BLIND_OFFSET_X+BLIND_PADDING), (short)32);
+        Util.arrayFillNonAtomic(tmpBuffer, BLIND_OFFSET_A, BLIND_PADDING, (byte)0);
+        Util.arrayCopyNonAtomic(a, aOff, tmpBuffer, (short)(BLIND_OFFSET_A+BLIND_PADDING), (short)32);
+        Biginteger.mult_rsa_trick(tmpBuffer, BLIND_OFFSET_A, tmpBuffer, BLIND_OFFSET_X, BLIND_SIZE, recvBuffer, ECDSA_OFFSET_ACC);
+        Biginteger.mod(recvBuffer, ECDSA_OFFSET_ACC, BIGNUM_SIZE, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32);
+    }
+
+    /**
+     * Verifies the signature that signEcdsa() just computed, r at buffer[ECDSA_APDU_R+1] and s at
+     * buffer[ECDSA_APDU_T], against h at recvBuffer[ECDSA_OFFSET_H] and the public key of privkey,
+     * with the textbook ECDSA verification (BIP461 verify()):
+     *   u1 = h * s^-1 mod n,  u2 = r * s^-1 mod n,  R' = u1*G + u2*P,  accept if x(R') mod n = r
+     * A signature that does not verify is the sign of a computation error or of an injected
+     * fault, and a faulty signature next to a correct one for the same deterministic nonce can
+     * give the private key away: SW_ECDSA_VERIFY_FAILED is thrown, and signEcdsa() erases
+     * everything without outputting a single byte of the signature.
+     *
+     * Only public values are handled (r, s, h, P): no blinding is needed. The platform Signature
+     * engine is not involved: u2*P is a key agreement with y on the base point P, and the sum
+     * with u1*G is the ALG_EC_PACE_GM key agreement (the multAndAdd of JCMathLib's ECPoint).
+     * r and s are left untouched.
+     */
+    private void ecdsaVerify(ECPrivateKey privkey, byte[] buffer) {
+        boolean valid = false;
+        try {
+            // s^-1 (s is not 0)
+            Util.arrayCopyNonAtomic(buffer, ECDSA_APDU_T, buffer, (short)(ECDSA_APDU_INV+32), (short)32);
+            invertModOrder(buffer);
+            // u2 = r * s^-1 mod n: not 0, since r and s are not
+            mulModOrderPublic(buffer, (short)(ECDSA_APDU_R+1), buffer, (short)(ECDSA_APDU_INV+32));
+            Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_PRODUCT, recvBuffer, ECDSA_OFFSET_X, (short)32);
+            // u1 = h * s^-1 mod n: 0 when h is 0, i.e. when the hash is a multiple of n
+            mulModOrderPublic(recvBuffer, ECDSA_OFFSET_H, buffer, (short)(ECDSA_APDU_INV+32));
+            Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_PRODUCT, buffer, ECDSA_APDU_V, (short)32);
+            // P = d*G, computed by the key object itself, then u2*P
+            getPublicKey(privkey, buffer, ECDSA_APDU_Q);
+            setEphemeralScalar(recvBuffer, ECDSA_OFFSET_X);
+            keyAgreement.init(ephemeral_privkey);
+            keyAgreement.generateSecret(buffer, ECDSA_APDU_Q, (short)65, recvBuffer, ECDSA_OFFSET_ACC);
+            // R' = u1*G + u2*P. A key object does not take the scalar 0: then R' = u2*P.
+            if (Biginteger.equalZero(buffer, ECDSA_APDU_V, (short)32)) {
+                Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_ACC, recvBuffer, ECDSA_OFFSET_D, (short)65);
+            } else {
+                setEphemeralScalar(buffer, ECDSA_APDU_V);
+                keyAgreementAdd.init(ephemeral_privkey);
+                keyAgreementAdd.generateSecret(recvBuffer, ECDSA_OFFSET_ACC, (short)65, recvBuffer, ECDSA_OFFSET_D);
+            }
+            // x(R') mod n == r ?
+            reduceModOrder(recvBuffer, (short)(ECDSA_OFFSET_D+1));
+            valid = (recvBuffer[ECDSA_OFFSET_D] == (byte)0x04)
+                    && (Util.arrayCompare(recvBuffer, (short)(ECDSA_OFFSET_D+1), buffer, (short)(ECDSA_APDU_R+1), (short)32) == (byte)0);
+        } catch (CryptoException e) {
+            // e.g. u1*G + u2*P is the point at infinity: not a valid signature
+            valid = false;
+        }
+        if (!valid)
+            ISOException.throwIt(SW_ECDSA_VERIFY_FAILED);
     }
 
     /**
