@@ -23,7 +23,9 @@ package org.satochip.applet;
 import javacard.framework.JCSystem;
 import javacard.framework.SystemException;
 import javacard.framework.Util;
+import javacard.security.Key;
 import javacard.security.KeyBuilder;
+import javacard.security.RSAPrivateKey;
 import javacard.security.RSAPublicKey;
 import javacardx.crypto.Cipher;
 
@@ -56,7 +58,7 @@ public class Biginteger {
     static boolean FLAG_FAST_MULT_VIA_RSA = false;
     private static final byte[] CONST_TWO = {0x02};
     /**
-     * Modulus of rsa_pubkey_pow2: a 768-bit RSA modulus (two 384-bit primes), generated once offline
+     * Modulus of rsa_key_pow2: a 768-bit RSA modulus (two 384-bit primes), generated once offline
      * with its private key discarded. Its factors play no role: the engine only computes exact
      * squares x^2 < 2^767 < n, which never wrap around. A genuine RSA modulus (odd, composite, no
      * small prime factor) is used rather than e.g. 2^768-1, which is divisible by 3: implementations
@@ -77,7 +79,8 @@ public class Biginteger {
         (byte)0xBD, (byte)0x51, (byte)0xE7, (byte)0xFC, (byte)0xDD, (byte)0xE1, (byte)0x40, (byte)0x07
     };
     
-    private static RSAPublicKey rsa_pubkey_pow2 = null;
+    // the squaring key (public or private type, see init()): kept referenced as long as the cipher uses it
+    private static Key rsa_key_pow2 = null;
     private static Cipher rsa_cipher = null;
     
     // initialize static objects. Should be done only once, e.g. in applet constructor
@@ -95,28 +98,53 @@ public class Biginteger {
         }
         // RSA engine for fast squaring: with exponent 2, the engine computes x^2 mod n, which is
         // x^2 itself whenever x^2 < n. Any 768-bit (BUFFER_SIZE bytes) modulus works, so no key
-        // pair is generated: a public key with a constant modulus is enough. This saves the RSA
-        // key generation at install and the storage of an unused private key.
-        rsa_pubkey_pow2 = (RSAPublicKey) KeyBuilder.buildKey(KeyBuilder.TYPE_RSA_PUBLIC, KeyBuilder.LENGTH_RSA_768, false);
-        rsa_pubkey_pow2.setModulus(RSA_SQUARING_MODULUS, (short) 0, (short) RSA_SQUARING_MODULUS.length);
-        rsa_pubkey_pow2.setExponent(CONST_TWO, (short) 0, (short) CONST_TWO.length);
+        // pair is generated: a key with a constant modulus is enough.
+        // Two ways of asking for the square are probed, in this order:
+        //   1. a public key with exponent 2, MODE_ENCRYPT (the historical way, what cards take);
+        //   2. a "private" key with exponent 2, MODE_DECRYPT, for platforms that refuse an even
+        //      public exponent (BouncyCastle does, hence the JCardEngine simulator).
+        // Either way the exponent is the public constant 2: there is no secret in the key.
         rsa_cipher = Cipher.getInstance(Cipher.ALG_RSA_NOPAD, false);
-
         FLAG_FAST_MULT_VIA_RSA = false; // set true only if succesfully allocated and tested below
         try { // Subsequent code may fail on some real (e.g., Infineon CJTOP80K) cards - catch exception
-            rsa_cipher.init(rsa_pubkey_pow2, Cipher.MODE_ENCRYPT);
-            // self-test: the engine must really compute a plain square (3^2 = 9), otherwise the
-            // Schnorr/MuSig2 arithmetic would silently produce invalid signatures
-            Util.arrayFillNonAtomic(buffer1, (short) 0, BUFFER_SIZE, (byte) 0);
-            buffer1[(short)(BUFFER_SIZE-1)] = (byte) 3;
-            rsa_cipher.doFinal(buffer1, (short) 0, BUFFER_SIZE, buffer1, (short) 0);
-            buffer1[(short)(BUFFER_SIZE-1)] ^= (byte) 9;
-            FLAG_FAST_MULT_VIA_RSA = equalZero(buffer1, (short) 0, BUFFER_SIZE);
+            RSAPublicKey pubkey = (RSAPublicKey) KeyBuilder.buildKey(KeyBuilder.TYPE_RSA_PUBLIC, KeyBuilder.LENGTH_RSA_768, false);
+            pubkey.setModulus(RSA_SQUARING_MODULUS, (short) 0, (short) RSA_SQUARING_MODULUS.length);
+            pubkey.setExponent(CONST_TWO, (short) 0, (short) CONST_TWO.length);
+            rsa_key_pow2 = pubkey;
+            rsa_cipher.init(pubkey, Cipher.MODE_ENCRYPT);
+            FLAG_FAST_MULT_VIA_RSA = squaringSelfTest();
         } catch (Exception ignored) {
         } // discard exception
+        if (!FLAG_FAST_MULT_VIA_RSA) {
+            try {
+                RSAPrivateKey privkey = (RSAPrivateKey) KeyBuilder.buildKey(KeyBuilder.TYPE_RSA_PRIVATE, KeyBuilder.LENGTH_RSA_768, false);
+                privkey.setModulus(RSA_SQUARING_MODULUS, (short) 0, (short) RSA_SQUARING_MODULUS.length);
+                // the exponent is given at the full modulus length: 00..00 02
+                Util.arrayFillNonAtomic(buffer1, (short) 0, BUFFER_SIZE, (byte) 0);
+                buffer1[(short)(BUFFER_SIZE-1)] = (byte) 2;
+                privkey.setExponent(buffer1, (short) 0, BUFFER_SIZE);
+                rsa_key_pow2 = privkey;
+                rsa_cipher.init(privkey, Cipher.MODE_DECRYPT);
+                FLAG_FAST_MULT_VIA_RSA = squaringSelfTest();
+            } catch (Exception ignored) {
+            } // discard exception
+        }
         Util.arrayFillNonAtomic(buffer1, (short) 0, BUFFER_SIZE, (byte) 0);
     }
     
+    /**
+     * Self-test of the squaring engine: it must really compute a plain square (3^2 = 9),
+     * otherwise the Schnorr/MuSig2/ECDSA arithmetic would silently produce invalid signatures.
+     * rsa_cipher must have been initialized. Uses buffer1.
+     */
+    private static boolean squaringSelfTest() {
+        Util.arrayFillNonAtomic(buffer1, (short) 0, BUFFER_SIZE, (byte) 0);
+        buffer1[(short)(BUFFER_SIZE-1)] = (byte) 3;
+        rsa_cipher.doFinal(buffer1, (short) 0, BUFFER_SIZE, buffer1, (short) 0);
+        buffer1[(short)(BUFFER_SIZE-1)] ^= (byte) 9;
+        return equalZero(buffer1, (short) 0, BUFFER_SIZE);
+    }
+
     /**
      * Addition with carry report. Adds other to this number. If this
      * is too small for the result (i.e., an overflow occurs) the
