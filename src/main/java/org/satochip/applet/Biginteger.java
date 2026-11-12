@@ -79,6 +79,54 @@ public class Biginteger {
         (byte)0xBD, (byte)0x51, (byte)0xE7, (byte)0xFC, (byte)0xDD, (byte)0xE1, (byte)0x40, (byte)0x07
     };
     
+    /*
+     * Modular inverse modulo the secp256k1 group order n, on the RSA engine.
+     *
+     * By Fermat's little theorem x^-1 = x^(n-2) mod n, so one raw RSA exponentiation with the
+     * exponent n-2 gives the inverse (the approach of JCMathLib, MIT license,
+     * https://github.com/OpenCryptoProject/JCMathLib, BigNat.modInv / ResourceManager).
+     *
+     * Platforms differ in the key they accept, so init() probes four forms and keeps the first
+     * one that passes a known-answer test (3^-1 mod n):
+     *   0. modulus n*c (512 bits, full length), public key,  MODE_ENCRYPT
+     *   1. modulus n*c (512 bits, full length), private key, MODE_DECRYPT
+     *   2. modulus n zero-padded to 512 bits,   private key, MODE_DECRYPT  (JCMathLib on JCOP4)
+     *   3. modulus n zero-padded to 512 bits,   public key,  MODE_ENCRYPT  (JCMathLib on JCOP3)
+     * n itself is prime, which RSA implementations that validate their modulus refuse
+     * (BouncyCastle, hence the simulator), and a modulus with leading zeros is not accepted
+     * everywhere either. n*c is a genuine full-length odd composite: the engine returns
+     * x^(n-2) mod n*c, and reducing that modulo n gives x^(n-2) mod n, since n divides n*c.
+     *
+     * The cofactor c is a nothing-up-my-sleeve 256-bit prime: the first prime at or above
+     *   SHA256("Satochip self-built ECDSA: cofactor of the modular inverse modulus") | 3*2^254 | 1
+     *   c = 0xD27B226A2BDE4EF19112CC3E98CB378B7B1DEAB26408E4EB6462283385FAD6EB
+     *
+     * The exponent n-2 is public. The base x is seen by the platform: callers must only invert
+     * values that are public or randomly masked (see Satochip, self-built ECDSA).
+     */
+    static boolean FLAG_MODINV_VIA_RSA = false;
+    /** Size of the in/out block of modInv(): the value sits in its last 32 bytes. */
+    public static final short MODINV_SIZE = (short)64;
+    private static final byte[] MODINV_MODULUS = {
+        (byte)0xD2, (byte)0x7B, (byte)0x22, (byte)0x6A, (byte)0x2B, (byte)0xDE, (byte)0x4E, (byte)0xF1,
+        (byte)0x91, (byte)0x12, (byte)0xCC, (byte)0x3E, (byte)0x98, (byte)0xCB, (byte)0x37, (byte)0x8A,
+        (byte)0x6F, (byte)0xA4, (byte)0xE2, (byte)0x30, (byte)0x10, (byte)0xA7, (byte)0xA9, (byte)0x7A,
+        (byte)0x3A, (byte)0xDA, (byte)0xC6, (byte)0x63, (byte)0xF3, (byte)0x0A, (byte)0x56, (byte)0x20,
+        (byte)0x4E, (byte)0x5F, (byte)0xEA, (byte)0xF0, (byte)0xDD, (byte)0x50, (byte)0xC7, (byte)0x47,
+        (byte)0xBD, (byte)0xCC, (byte)0xFE, (byte)0xB7, (byte)0x89, (byte)0xC1, (byte)0x96, (byte)0x5F,
+        (byte)0x74, (byte)0x9E, (byte)0x14, (byte)0xE1, (byte)0x4D, (byte)0x7E, (byte)0x2F, (byte)0x45,
+        (byte)0xC2, (byte)0xB9, (byte)0x2E, (byte)0x25, (byte)0xFA, (byte)0xD4, (byte)0x3C, (byte)0xAB
+    };
+    /** 3^-1 mod n, for the known-answer test of the inversion engine. */
+    private static final byte[] MODINV_SELFTEST_INV3 = {
+        (byte)0xAA, (byte)0xAA, (byte)0xAA, (byte)0xAA, (byte)0xAA, (byte)0xAA, (byte)0xAA, (byte)0xAA,
+        (byte)0xAA, (byte)0xAA, (byte)0xAA, (byte)0xAA, (byte)0xAA, (byte)0xAA, (byte)0xAA, (byte)0xA9,
+        (byte)0xD1, (byte)0xC9, (byte)0xE8, (byte)0x99, (byte)0xCA, (byte)0x30, (byte)0x6A, (byte)0xD2,
+        (byte)0x7F, (byte)0xE1, (byte)0x94, (byte)0x5D, (byte)0xE0, (byte)0x24, (byte)0x2B, (byte)0x81
+    };
+    private static Key rsa_key_inv = null;
+    private static Cipher rsa_cipher_inv = null;
+
     // the squaring key (public or private type, see init()): kept referenced as long as the cipher uses it
     private static Key rsa_key_pow2 = null;
     private static Cipher rsa_cipher = null;
@@ -129,7 +177,74 @@ public class Biginteger {
             } catch (Exception ignored) {
             } // discard exception
         }
+        initModInv();
         Util.arrayFillNonAtomic(buffer1, (short) 0, BUFFER_SIZE, (byte) 0);
+        Util.arrayFillNonAtomic(buffer2, (short) 0, BUFFER_SIZE, (byte) 0);
+        // the key objects of the forms that were probed and rejected are garbage now
+        if (JCSystem.isObjectDeletionSupported())
+            JCSystem.requestObjectDeletion();
+    }
+
+    /** Probes the four forms of the inversion engine (see MODINV_MODULUS), sets FLAG_MODINV_VIA_RSA. */
+    private static void initModInv() {
+        FLAG_MODINV_VIA_RSA = false;
+        try {
+            rsa_cipher_inv = Cipher.getInstance(Cipher.ALG_RSA_NOPAD, false);
+        } catch (Exception e) {
+            return;
+        }
+        for (byte form = (byte) 0; form < (byte) 4 && !FLAG_MODINV_VIA_RSA; form++) {
+            try {
+                FLAG_MODINV_VIA_RSA = tryModInvForm(form);
+            } catch (Exception ignored) {
+            } // this form is not supported by the platform: try the next one
+        }
+    }
+
+    private static boolean tryModInvForm(byte form) {
+        boolean fullModulus = (form < (byte) 2);
+        boolean publicKey = (form == (byte) 0 || form == (byte) 3);
+        // buffer2[0..64) = modulus, buffer1[0..64) = exponent n-2, zero-padded
+        Util.arrayFillNonAtomic(buffer1, (short) 0, BUFFER_SIZE, (byte) 0);
+        Util.arrayFillNonAtomic(buffer2, (short) 0, BUFFER_SIZE, (byte) 0);
+        if (fullModulus) {
+            Util.arrayCopyNonAtomic(MODINV_MODULUS, (short) 0, buffer2, (short) 0, MODINV_SIZE);
+        } else {
+            Util.arrayCopyNonAtomic(Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, buffer2, (short) 32, (short) 32);
+        }
+        Util.arrayCopyNonAtomic(Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, buffer1, (short) 32, (short) 32);
+        buffer1[(short) 63] -= (byte) 2; // n ends with 0x41: no borrow
+        if (publicKey) {
+            RSAPublicKey key = (RSAPublicKey) KeyBuilder.buildKey(KeyBuilder.TYPE_RSA_PUBLIC, KeyBuilder.LENGTH_RSA_512, false);
+            key.setModulus(buffer2, (short) 0, MODINV_SIZE);
+            key.setExponent(buffer1, (short) 32, (short) 32);
+            rsa_key_inv = key;
+            rsa_cipher_inv.init(key, Cipher.MODE_ENCRYPT);
+        } else {
+            RSAPrivateKey key = (RSAPrivateKey) KeyBuilder.buildKey(KeyBuilder.TYPE_RSA_PRIVATE, KeyBuilder.LENGTH_RSA_512, false);
+            key.setModulus(buffer2, (short) 0, MODINV_SIZE);
+            key.setExponent(buffer1, (short) 0, MODINV_SIZE);
+            rsa_key_inv = key;
+            rsa_cipher_inv.init(key, Cipher.MODE_DECRYPT);
+        }
+        // known-answer test: 3^-1 mod n
+        Util.arrayFillNonAtomic(buffer1, (short) 0, BUFFER_SIZE, (byte) 0);
+        buffer1[(short) (MODINV_SIZE - 1)] = (byte) 3;
+        modInv(buffer1, (short) 0);
+        return Util.arrayCompare(buffer1, (short) 32, MODINV_SELFTEST_INV3, (short) 0, (short) 32) == (byte) 0;
+    }
+
+    /**
+     * Replaces the value x at buf[off..off+64) (MODINV_SIZE bytes, Most Significant Byte First,
+     * 0 < x < n, so the first 32 bytes are zero) with x^-1 mod n, again in the last 32 bytes.
+     *
+     * NOT constant time and NOT blind: the platform RSA engine sees x, and the reduction modulo n
+     * runs in data-dependent time. x must be public, or a secret multiplied by a fresh random mask.
+     * Uses buffer1 and buffer2. Requires FLAG_MODINV_VIA_RSA.
+     */
+    public static void modInv(byte[] buf, short off) {
+        rsa_cipher_inv.doFinal(buf, off, MODINV_SIZE, buf, off);
+        mod(buf, off, MODINV_SIZE, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short) 32);
     }
     
     /**

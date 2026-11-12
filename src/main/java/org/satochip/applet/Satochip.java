@@ -330,6 +330,8 @@ public class Satochip extends javacard.framework.Applet {
 
     // JC API 3.0.4 does not define this constant (added in 3.0.5):
     private final static byte ALG_EC_SVDP_DH_PLAIN_XY= (byte) 6; //https://docs.oracle.com/javacard/3.0.5/api/javacard/security/KeyAgreement.html#ALG_EC_SVDP_DH_PLAIN_XY
+    // idem: with a private key s and the point Q as "public data", the engine returns s*G + Q (uncompressed)
+    private final static byte ALG_EC_PACE_GM= (byte) 5; //https://docs.oracle.com/javacard/3.0.5/api/javacard/security/KeyAgreement.html#ALG_EC_PACE_GM
     private final static short LENGTH_EC_FP_256= KeyBuilder.LENGTH_EC_FP_256;
 
     /****************************************
@@ -358,6 +360,8 @@ public class Satochip extends javacard.framework.Applet {
     // shared cryptographic objects
     private RandomData randomData;
     private KeyAgreement keyAgreement;
+    // point addition s*G + Q (ALG_EC_PACE_GM), for the verification of the self-built ECDSA signatures
+    private KeyAgreement keyAgreementAdd;
     private Signature sigECDSA;
     private Signature sigAESMAC;
 
@@ -585,10 +589,19 @@ public class Satochip extends javacard.framework.Applet {
         sha256= MessageDigest.getInstance(MessageDigest.ALG_SHA_256, false);
         HmacSha160.init(tmpBuffer);
         HmacSha512.init(tmpBuffer);
+        // SHA-256 for the nonce derivation of the self-built ECDSA: platform or bytecode backend,
+        // selected by the first byte of the applet-specific install data (see getInstallOption())
+        Sha256.init(sha256, getInstallOption(bArray, bOffset, bLength));
+        HmacSha256.init(tmpBuffer);
         try {
             keyAgreement = KeyAgreement.getInstance(ALG_EC_SVDP_DH_PLAIN_XY, false); 
         } catch (CryptoException e) {
             ISOException.throwIt(SW_UNSUPPORTED_FEATURE);// unsupported feature => use a more recent card!
+        }
+        try {
+            keyAgreementAdd = KeyAgreement.getInstance(ALG_EC_PACE_GM, false);
+        } catch (CryptoException e) {
+            ISOException.throwIt(SW_UNSUPPORTED_FEATURE);// no point addition: the self-built ECDSA cannot verify its signatures
         }
         
         sc_aes128_cbc= Cipher.getInstance(Cipher.ALG_AES_BLOCK_128_CBC_NOPAD, false);
@@ -643,6 +656,8 @@ public class Satochip extends javacard.framework.Applet {
         //Secp256k1.setCommonCurveParameters(taproot_tweakedkey); => done in setup() as it must be performed after each reset_to_factory!
         // initialize Biginteger static data (required for Schnorr signatures)
         Biginteger.init();
+        // the self-built ECDSA rests on these engines: refuse to install if one of them is missing or wrong
+        selfTestEcdsaBase();
 
         // 2FA
         data2FA= new byte[OFFSET_2FA_SIZE];
@@ -670,6 +685,101 @@ public class Satochip extends javacard.framework.Applet {
 
         register();
     } // end of constructor
+
+    /**
+     * Returns the first byte of the applet-specific install data, or 0 if there is none.
+     * The install parameters are [aid_size(1b) | AID | info_size(1b) | control info | data_size(1b) | data].
+     * The only option so far selects the SHA-256 backend of the self-built ECDSA nonce derivation:
+     * 0x00 or absent: Sha256.BACKEND_PLATFORM, 0x01: Sha256.BACKEND_BYTECODE
+     * (e.g. `gp --install applet.cap --params 01`). Both backends compute the same function,
+     * so the signatures do not depend on this choice.
+     */
+    private static byte getInstallOption(byte[] bArray, short bOffset, byte bLength) {
+        short end = (short)(bOffset + (short)(bLength & 0xFF));
+        short off = bOffset;
+        if (off >= end)
+            return (byte)0;
+        off += (short)(1 + (short)(bArray[off] & 0xFF)); // skip the AID
+        if (off >= end)
+            return (byte)0;
+        off += (short)(1 + (short)(bArray[off] & 0xFF)); // skip the control info
+        if ((short)(off + 1) >= end || bArray[off] == (byte)0)
+            return (byte)0;
+        return bArray[(short)(off + 1)];
+    }
+
+    /** SHA256("abc"), FIPS 180-4. */
+    private static final byte[] SELFTEST_SHA256_ABC = {
+        (byte)0xBA, (byte)0x78, (byte)0x16, (byte)0xBF, (byte)0x8F, (byte)0x01, (byte)0xCF, (byte)0xEA,
+        (byte)0x41, (byte)0x41, (byte)0x40, (byte)0xDE, (byte)0x5D, (byte)0xAE, (byte)0x22, (byte)0x23,
+        (byte)0xB0, (byte)0x03, (byte)0x61, (byte)0xA3, (byte)0x96, (byte)0x17, (byte)0x7A, (byte)0x9C,
+        (byte)0xB4, (byte)0x10, (byte)0xFF, (byte)0x61, (byte)0xF2, (byte)0x00, (byte)0x15, (byte)0xAD
+    };
+    /** RFC 4231 test case 1: HMAC-SHA256(key = 20 bytes 0x0b, data = "Hi There"). */
+    private static final byte[] SELFTEST_HMAC_DATA = {'H', 'i', ' ', 'T', 'h', 'e', 'r', 'e'};
+    private static final byte[] SELFTEST_HMAC_MAC = {
+        (byte)0xB0, (byte)0x34, (byte)0x4C, (byte)0x61, (byte)0xD8, (byte)0xDB, (byte)0x38, (byte)0x53,
+        (byte)0x5C, (byte)0xA8, (byte)0xAF, (byte)0xCE, (byte)0xAF, (byte)0x0B, (byte)0xF1, (byte)0x2B,
+        (byte)0x88, (byte)0x1D, (byte)0xC2, (byte)0x00, (byte)0xC9, (byte)0x83, (byte)0x3D, (byte)0xA7,
+        (byte)0x26, (byte)0xE9, (byte)0x37, (byte)0x6C, (byte)0x2E, (byte)0x32, (byte)0xCF, (byte)0xF7
+    };
+
+    /**
+     * Known-answer tests of the engines the self-built ECDSA rests on, run once at install:
+     * the RSA squaring and the modular inverse (tested by Biginteger.init()), SHA-256 and
+     * HMAC-SHA256 on the selected backend, and the point addition (2*G + G against 3*G).
+     * A card that fails any of them could not sign, or worse, would sign wrongly: the
+     * installation is refused with SW_UNSUPPORTED_FEATURE.
+     * Uses recvBuffer and the scratch key; all the values are public constants.
+     */
+    private void selfTestEcdsaBase() {
+        boolean ok = Biginteger.FLAG_FAST_MULT_VIA_RSA && Biginteger.FLAG_MODINV_VIA_RSA;
+        try {
+            // SHA-256("abc")
+            Sha256.reset();
+            Sha256.doFinal(SELFTEST_HMAC_DATA, (short)0, (short)0, recvBuffer, (short)0); // empty message: exercises reset/doFinal
+            recvBuffer[(short)0] = (byte)'a';
+            recvBuffer[(short)1] = (byte)'b';
+            recvBuffer[(short)2] = (byte)'c';
+            Sha256.reset();
+            Sha256.doFinal(recvBuffer, (short)0, (short)3, recvBuffer, (short)32);
+            ok = ok && (Util.arrayCompare(recvBuffer, (short)32, SELFTEST_SHA256_ABC, (short)0, (short)32) == (byte)0);
+
+            // HMAC-SHA256, RFC 4231 test case 1 (a 20-byte key is the same key zero-padded to 32 bytes)
+            Util.arrayFillNonAtomic(recvBuffer, (short)0, (short)20, (byte)0x0B);
+            Util.arrayFillNonAtomic(recvBuffer, (short)20, (short)12, (byte)0x00);
+            HmacSha256.begin(recvBuffer, (short)0);
+            HmacSha256.update(SELFTEST_HMAC_DATA, (short)0, (short)SELFTEST_HMAC_DATA.length);
+            HmacSha256.finish(recvBuffer, (short)0, recvBuffer, (short)32);
+            ok = ok && (Util.arrayCompare(recvBuffer, (short)32, SELFTEST_HMAC_MAC, (short)0, (short)32) == (byte)0);
+
+            // point addition: 2*G + G must be the point 3*G computed by the scalar multiplication
+            Util.arrayFillNonAtomic(recvBuffer, (short)0, (short)32, (byte)0x00);
+            recvBuffer[(short)31] = (byte)2;
+            setEphemeralScalar(recvBuffer, (short)0);
+            keyAgreementAdd.init(ephemeral_privkey);
+            short size = keyAgreementAdd.generateSecret(Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_G, (short)65, recvBuffer, (short)32);
+            recvBuffer[(short)31] = (byte)3;
+            setEphemeralScalar(recvBuffer, (short)0);
+            getPublicKey(ephemeral_privkey, recvBuffer, (short)97);
+            ok = ok && (size == (short)65)
+                    && (Util.arrayCompare(recvBuffer, (short)32, recvBuffer, (short)97, (short)65) == (byte)0);
+        } catch (CryptoException e) {
+            ok = false;
+        }
+        clearEphemeralKey();
+        Util.arrayFillNonAtomic(recvBuffer, (short)0, (short)recvBuffer.length, (byte)0);
+        if (!ok)
+            ISOException.throwIt(SW_UNSUPPORTED_FEATURE);
+    }
+
+    /** Loads a 32-byte scalar in [1, n-1] into the scratch EC key (see ephemeral_privkey). */
+    private void setEphemeralScalar(byte[] src, short srcOff) {
+        if (ephemeral_privkey_transient) {
+            Secp256k1.setCommonCurveParameters(ephemeral_privkey);
+        }
+        ephemeral_privkey.setS(src, srcOff, (short)32);
+    }
 
     /**
      * Builds a secp256k1 private key, in RAM if the card supports it, otherwise in EEPROM.
