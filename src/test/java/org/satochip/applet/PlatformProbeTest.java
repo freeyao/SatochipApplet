@@ -120,7 +120,11 @@ public class PlatformProbeTest {
   private String rsaRun(int keyType, int mode, BigInteger modulus, int size, BigInteger exp, BigInteger in)
       throws Exception {
     send(ProbeApplet.INS_SET_MODULUS, 0, 0, fixed(modulus, size));
-    send(ProbeApplet.INS_SET_EXPONENT, 0, 0, exp.bitLength() <= 8 ? new byte[]{exp.byteValue()} : fixed(exp, 32));
+    // a public exponent is sent at its natural length; the simulator only takes a private
+    // exponent padded to the modulus length (CryptoException ILLEGAL_VALUE otherwise)
+    byte[] expBytes = keyType == RSA_PRIVATE ? fixed(exp, size)
+        : exp.bitLength() <= 8 ? new byte[]{exp.byteValue()} : fixed(exp, 32);
+    send(ProbeApplet.INS_SET_EXPONENT, 0, 0, expBytes);
     byte[] r = send(ProbeApplet.INS_RSA, keyType, mode, fixed(in, size));
     if (r.length == 0) return "NO DATA";
     byte[] body = Arrays.copyOfRange(r, 1, r.length);
