@@ -23,6 +23,7 @@ package org.satochip.applet;
 import javacard.framework.JCSystem;
 import javacard.framework.SystemException;
 import javacard.framework.Util;
+import javacard.security.CryptoException;
 import javacard.security.Key;
 import javacard.security.KeyBuilder;
 import javacard.security.RSAPrivateKey;
@@ -133,17 +134,10 @@ public class Biginteger {
     
     // initialize static objects. Should be done only once, e.g. in applet constructor
     public static void init(){
-        // init arrays
-        try {
-            buffer1 = JCSystem.makeTransientByteArray(BUFFER_SIZE, JCSystem.CLEAR_ON_DESELECT);
-        } catch (SystemException e) {
-            buffer1 = new byte[BUFFER_SIZE];
-        }
-        try {
-            buffer2 = JCSystem.makeTransientByteArray(BUFFER_SIZE, JCSystem.CLEAR_ON_DESELECT);
-        } catch (SystemException e) {
-            buffer2 = new byte[BUFFER_SIZE];
-        }
+        // init arrays: RAM only (they hold blinded secrets and products of secrets while
+        // signing), cleared on deselect or else on reset; no fallback to persistent memory
+        buffer1 = Satochip.makeTransientArray(BUFFER_SIZE);
+        buffer2 = Satochip.makeTransientArray(BUFFER_SIZE);
         // RSA engine for fast squaring: with exponent 2, the engine computes x^2 mod n, which is
         // x^2 itself whenever x^2 < n. Any 768-bit (BUFFER_SIZE bytes) modulus works, so no key
         // pair is generated: a key with a constant modulus is enough.
@@ -227,11 +221,16 @@ public class Biginteger {
             rsa_key_inv = key;
             rsa_cipher_inv.init(key, Cipher.MODE_DECRYPT);
         }
-        // known-answer test: 3^-1 mod n
+        // known-answer tests: 3^-1 mod n, then back. The second input is a full-size value
+        // with no structure, so an engine that only handles small inputs does not pass.
         Util.arrayFillNonAtomic(buffer1, (short) 0, BUFFER_SIZE, (byte) 0);
         buffer1[(short) (MODINV_SIZE - 1)] = (byte) 3;
         modInv(buffer1, (short) 0);
-        return Util.arrayCompare(buffer1, (short) 32, MODINV_SELFTEST_INV3, (short) 0, (short) 32) == (byte) 0;
+        if (Util.arrayCompare(buffer1, (short) 32, MODINV_SELFTEST_INV3, (short) 0, (short) 32) != (byte) 0)
+            return false;
+        Util.arrayFillNonAtomic(buffer1, (short) 0, (short) 32, (byte) 0);
+        modInv(buffer1, (short) 0);
+        return equalZero(buffer1, (short) 0, (short) 63) && buffer1[(short) 63] == (byte) 3;
     }
 
     /**
@@ -243,7 +242,14 @@ public class Biginteger {
      * Uses buffer1 and buffer2. Requires FLAG_MODINV_VIA_RSA.
      */
     public static void modInv(byte[] buf, short off) {
-        rsa_cipher_inv.doFinal(buf, off, MODINV_SIZE, buf, off);
+        short len = rsa_cipher_inv.doFinal(buf, off, MODINV_SIZE, buf, off);
+        // an engine may return the result without its leading zero bytes: right-align it
+        if (len != MODINV_SIZE) {
+            if (len <= (short) 0 || len > MODINV_SIZE)
+                CryptoException.throwIt(CryptoException.ILLEGAL_VALUE);
+            Util.arrayCopyNonAtomic(buf, off, buf, (short) (off + MODINV_SIZE - len), len);
+            Util.arrayFillNonAtomic(buf, off, (short) (MODINV_SIZE - len), (byte) 0);
+        }
         mod(buf, off, MODINV_SIZE, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short) 32);
     }
     

@@ -132,15 +132,17 @@ public class EcdsaExposedAppletTest {
     verify.setAccessible(true);
     byte[] recvBuffer = (byte[]) field(applet, "recvBuffer");
     byte[] tmpBuffer = (byte[]) field(applet, "tmpBuffer");
+    byte[] ecdsaRam = (byte[]) field(applet, "ecdsaRam");
     byte[] apdu = new byte[constant("ECDSA_APDU_SIZE")];
-    System.arraycopy(h, 0, recvBuffer, constant("ECDSA_OFFSET_H"), 32);
+    // the verification reads the second copies of h and s
+    System.arraycopy(h, 0, ecdsaRam, constant("ECDSA_RAM_H2"), 32);
     System.arraycopy(r, 0, apdu, constant("ECDSA_APDU_R") + 1, 32);
-    System.arraycopy(s, 0, apdu, constant("ECDSA_APDU_T"), 32);
+    System.arraycopy(s, 0, ecdsaRam, constant("ECDSA_RAM_S2"), 32);
     try {
       verify.invoke(applet, key, apdu);
       // the check must leave r and s untouched: they are encoded and output right after it
       assertArrayEquals(r, Arrays.copyOfRange(apdu, constant("ECDSA_APDU_R") + 1, constant("ECDSA_APDU_R") + 33));
-      assertArrayEquals(s, Arrays.copyOfRange(apdu, constant("ECDSA_APDU_T"), constant("ECDSA_APDU_T") + 32));
+      assertArrayEquals(s, Arrays.copyOfRange(ecdsaRam, constant("ECDSA_RAM_S2"), constant("ECDSA_RAM_S2") + 32));
       return SatochipTest.SW_OK;
     } catch (InvocationTargetException e) {
       if (e.getCause() instanceof ISOException) {
@@ -149,6 +151,7 @@ public class EcdsaExposedAppletTest {
       throw e;
     } finally {
       Arrays.fill(recvBuffer, (byte) 0);
+      Arrays.fill(ecdsaRam, (byte) 0);
       Arrays.fill(tmpBuffer, (byte) 0);
     }
   }
