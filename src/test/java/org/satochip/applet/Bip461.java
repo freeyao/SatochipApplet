@@ -126,6 +126,19 @@ final class Bip461 {
     }
   }
 
+  /** The grind counter at which deterministic_sign() stops: 0 when the first nonce already gives a low r. */
+  static int grindCount(byte[] seckey, byte[] msghash) throws Exception {
+    int i = 0;
+    BigInteger[] rs = sign(seckey, msghash, new byte[0]);
+    while (rs[0].bitLength() > 255) {
+      i++;
+      byte[] extra = new byte[32];
+      extra[0] = (byte) i; extra[1] = (byte) (i >> 8); extra[2] = (byte) (i >> 16); extra[3] = (byte) (i >> 24);
+      rs = sign(seckey, msghash, extra);
+    }
+    return i;
+  }
+
   /** BIP461 deterministic_sign(): r | s, low-r by grinding, low-S. */
   static byte[] deterministicSign(byte[] seckey, byte[] msghash) throws Exception {
     BigInteger[] rs = sign(seckey, msghash, new byte[0]);

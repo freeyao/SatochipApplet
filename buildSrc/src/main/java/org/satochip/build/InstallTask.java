@@ -39,6 +39,23 @@ public class InstallTask extends DefaultTask {
   public static final String CAP_PROPERTY = "org.satochip.install.cap";
 
   /**
+   * Project property giving the applet-specific install data of the Satochip applet, in hex.
+   * Its first byte selects the SHA-256 backend of the self-built ECDSA nonce derivation:
+   * absent or 00 for the platform MessageDigest, 01 for the bytecode implementation
+   * (see Satochip.getInstallOption()), e.g. ./gradlew install -Porg.satochip.install.params=01
+   */
+  public static final String PARAMS_PROPERTY = "org.satochip.install.params";
+
+  private byte[] satochipInstallParams() {
+    Object value = getProject().findProperty(PARAMS_PROPERTY);
+    try {
+      return (value != null) ? Hex.decode(value.toString()) : new byte[0];
+    } catch (RuntimeException e) {
+      throw new GradleException(PARAMS_PROPERTY + " must be a hex string: " + value);
+    }
+  }
+
+  /**
    * The CAP to install: the file given with -Porg.satochip.install.cap=<file> (e.g. a CAP built
    * from another commit, see scripts/benchmark-commits.sh), or else the CAP built by convertJavacard.
    */
@@ -57,6 +74,7 @@ public class InstallTask extends DefaultTask {
   public void install() {
     // resolve the CAP before touching the card, so that a wrong path does not delete the applet
     File capFile = capFile();
+    byte[] satochipParams = satochipInstallParams();
     Logger logger = getLogger();
 
     TerminalFactory tf = TerminalManager.getTerminalFactory();
@@ -113,7 +131,7 @@ public class InstallTask extends DefaultTask {
       logger.info("Finished loading the new package!");
 
       logger.info("Installing the Satochip Applet");
-      cmdSet.installForInstall(PACKAGE_AID, SATOCHIP_AID, SATOCHIP_INSTANCE_AID, new byte[0]).checkOK();
+      cmdSet.installForInstall(PACKAGE_AID, SATOCHIP_AID, SATOCHIP_INSTANCE_AID, satochipParams).checkOK();
 
       logger.info("Installing the NDEF Applet");
       cmdSet.installForInstall(PACKAGE_AID, NDEF_AID, NDEF_INSTANCE_AID, NDEF_TAG).checkOK();

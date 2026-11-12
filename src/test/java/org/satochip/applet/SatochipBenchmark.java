@@ -33,13 +33,21 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.satochip.applet.SatochipTest.*;
 
 /**
- * Times the Schnorr and MuSig2 signing commands, plus two control commands, on the applet that is
+ * Times the ECDSA, Schnorr and MuSig2 signing commands, plus a control command, on the applet that is
  * currently installed on the card. Nothing is installed first, so that CAPs built from different
  * commits can be compared (see scripts/benchmark-commits.sh). Run with {@code ./gradlew benchmarkCard}.
  *
  * <p>Each APDU is timed individually with {@link System#nanoTime()} around the secure channel
- * round trip, after untimed warm-up rounds. The control commands (ECDSA signing, GET RANDOM) do
- * not use the code under test: if they differ between two runs, the measurement setup is drifting.
+ * round trip, after untimed warm-up rounds. The control command (GET RANDOM) does not use the
+ * code under test: if it differs between two runs, the measurement setup is drifting.
+ *
+ * <p>ECDSA signing (the self-built BIP461 ECDSA) does not take a fixed time: each low-r grinding
+ * attempt derives a nonce and computes R again. It is therefore timed per grind counter, over
+ * hashes chosen on the host so that the signature stops at counter 0, 1 or 2: the difference
+ * between two rows is the cost of one grinding attempt, and a wallet sees counter 0 half of the
+ * time, 1 a quarter of the time, and so on. To compare the two SHA-256 backends, install the
+ * applet once with each ({@code ./gradlew install -Porg.satochip.install.params=00} or
+ * {@code =01}) and run the benchmark with a different label after each install.
  *
  * <p>Results go to {@code <out>/<label>.csv} ({@code label,operation,iteration,micros}) and a
  * summary is printed. On the simulator target, this only checks that the harness works.
@@ -61,7 +69,7 @@ public class SatochipBenchmark {
   private TestSatochipCommandSet cmdSet;
 
   @Test
-  @DisplayName("Time Schnorr, MuSig2 and control commands")
+  @DisplayName("Time ECDSA, Schnorr, MuSig2 and a control command")
   void benchmark() throws Exception {
     Security.addProvider(new BouncyCastleProvider());
     cmdSet = new TestSatochipCommandSet(openChannel());
@@ -95,10 +103,20 @@ public class SatochipBenchmark {
       assertEquals(32, psig.length, "a MuSig2 partial signature is 32 bytes");
     }
 
-    // controls: not affected by the blinded Schnorr/MuSig2 arithmetic
-    for (int i = -warmup; i < iterations; i++) {
-      time("ecdsa_sign (control)", i, () -> cmdSet.sendRawSecure(INS_SIGN_TRANSACTION_HASH, 0xFF, 0x00, hash));
+    // ECDSA (self-built, BIP461), with the BIP32 key derived in prepare(): one row per grind counter
+    byte[] ecdsaKey = bip32PrivateKey();
+    for (int grind = 0; grind <= 2; grind++) {
+      List<byte[]> hashes = hashesWithGrindCount(ecdsaKey, grind, warmup + iterations);
+      String operation = "ecdsa_sign_grind" + grind;
+      for (int i = -warmup; i < iterations; i++) {
+        byte[] h = hashes.get(i + warmup);
+        // the result is not checked here, so that applets from before the self-built ECDSA can
+        // still be measured with scripts/benchmark-commits.sh (their rows do not depend on the counter)
+        time(operation, i, () -> cmdSet.sendRawSecure(INS_SIGN_TRANSACTION_HASH, 0xFF, 0x00, h));
+      }
     }
+
+    // control: not affected by the signature arithmetic
     for (int i = -warmup; i < iterations; i++) {
       time("get_random (control)", i, () -> cmdSet.sendRawSecure(INS_GET_RANDOM, 32, 0x00, new byte[0]));
     }
@@ -117,6 +135,30 @@ public class SatochipBenchmark {
       assertEquals(SW_OK, cmdSet.cardBip32ImportSeed(Vectors.BIP32_SEED).getSw(), "could not seed the card");
     }
     cmdSet.cardBip32GetExtendedKeyRaw("m/86'/0'/0'/0/0");
+  }
+
+  /** The private key of m/86'/0'/0'/0/0 for the test seed, i.e. the key SIGN TRANSACTION HASH uses with p1 = 0xFF. */
+  private static byte[] bip32PrivateKey() {
+    org.bitcoinj.crypto.DeterministicKey key =
+        org.bitcoinj.crypto.HDKeyDerivation.createMasterPrivateKey(Vectors.BIP32_SEED);
+    int[][] path = {{86, 1}, {0, 1}, {0, 1}, {0, 0}, {0, 0}};
+    for (int[] c : path) {
+      key = org.bitcoinj.crypto.HDKeyDerivation.deriveChildKey(key,
+          new org.bitcoinj.crypto.ChildNumber(c[0], c[1] == 1));
+    }
+    return Bip461.fixed32(key.getPrivKey());
+  }
+
+  /** {@code count} distinct hashes whose BIP461 signature with {@code seckey} stops at the given grind counter. */
+  private static List<byte[]> hashesWithGrindCount(byte[] seckey, int grind, int count) throws Exception {
+    List<byte[]> out = new ArrayList<>();
+    for (int j = 0; out.size() < count; j++) {
+      byte[] h = sha256(("satochip ecdsa benchmark " + j).getBytes());
+      if (Bip461.grindCount(seckey, h) == grind) {
+        out.add(h);
+      }
+    }
+    return out;
   }
 
   private interface Apdu {

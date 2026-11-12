@@ -262,10 +262,20 @@ scripts/benchmark-commits.sh --build-only 87761e9^ 87761e9   # only build the tw
 
 It builds the CAP of each revision in a temporary git worktree, then installs each one in turn
 (`./gradlew install -Porg.satochip.install.cap=<file>`) and runs `./gradlew benchmarkCard`, which
-times Schnorr signing, the MuSig2 nonce and signing steps, and two control commands (ECDSA signing,
-GET RANDOM) on whatever applet is on the card, without installing anything. It finally prints the
-median of each operation per revision and the ratio. The control commands should not change between
-revisions: if they do, the measurement is drifting. `benchmarkCard` is excluded from `./gradlew test`.
+times ECDSA signing, Schnorr signing, the MuSig2 nonce and signing steps, and a control command
+(GET RANDOM) on whatever applet is on the card, without installing anything. It finally prints the
+median of each operation per revision and the ratio. The control command should not change between
+revisions: if it does, the measurement is drifting. `benchmarkCard` is excluded from `./gradlew test`.
+
+ECDSA signing is the self-built BIP461 ECDSA, whose duration depends on how many low-r grinding
+attempts a signature needs: it is reported as `ecdsa_sign_grind0`, `_grind1` and `_grind2`, over
+hashes that stop at that grind counter. Its nonce derivation runs on one of two SHA-256 backends,
+chosen at install; to time both, install with each and benchmark under a different label:
+
+```sh
+./gradlew install -Porg.satochip.install.params=00 && ./gradlew benchmarkCard -Porg.satochip.bench.label=sha-platform
+./gradlew install -Porg.satochip.install.params=01 && ./gradlew benchmarkCard -Porg.satochip.bench.label=sha-bytecode
+```
 
 **Every install deletes the applet and all its data on the card: use a spare development card.**
 At the end the card holds the second revision; run `./gradlew install` to put the current checkout
