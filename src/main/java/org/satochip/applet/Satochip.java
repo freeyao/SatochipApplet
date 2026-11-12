@@ -306,6 +306,8 @@ public class Satochip extends javacard.framework.Applet {
     /** Taproot very low probability error*/
     private final static short SW_TAPROOT_TWEAK_ERROR = (short) 0x9C43;
     private final static short SW_SCHNORR_INVALID_NONCE = (short) 0x9C4C;
+    /** Self-built ECDSA: no acceptable nonce was found within the attempt limits (not expected to happen) */
+    private final static short SW_ECDSA_NONCE_ERROR = (short) 0x9C4E;
 
     /** MuSig2 errors **/
     private final static short SW_BIP327_WRONG_SECNONCE = (short) 0x9C44;
@@ -2543,8 +2545,12 @@ public class Satochip extends javacard.framework.Applet {
      * data: [hash(32b) | option: 2FA-flag(2b)|hmac(20b)]
      * 
      * return: [sig ]
-     *   sig is the DER-encoded ECDSA signature as produced by the card, NOT normalized to low-S:
-     *   the client must replace s with n-s when s > n/2 (BIP62/BIP146), or Bitcoin nodes will reject it.
+     *   sig is the DER-encoded ECDSA signature. It is computed by the applet itself as specified in
+     *   BIP461 (see signEcdsa()), not by the platform Signature engine: the nonce is the RFC 6979
+     *   nonce (HMAC-SHA256, no extra entropy), r is ground to low-r and s is normalized to low-S.
+     *   The signature is therefore deterministic: the same key and hash always give the same
+     *   bytes, which are those libsecp256k1 / Bitcoin Core produce. The client has nothing left
+     *   to normalize. r and s are at most 32 bytes each, so the signature is at most 70 bytes.
      *
      */
     private short SignTransactionHash(APDU apdu, byte[] buffer){
@@ -2577,10 +2583,304 @@ public class Satochip extends javacard.framework.Applet {
                 ISOException.throwIt(SW_SIGNATURE_INVALID);
         }
 
-        // hash+sign singlehash
-        sigECDSA.init(privkey, Signature.MODE_SIGN);
-        short sign_size= sigECDSA.signPreComputedHash(buffer, ISO7816.OFFSET_CDATA, MessageDigest.LENGTH_SHA_256, buffer, (short)0);
-        return sign_size;
+        // sign the hash with the self-built ECDSA
+        return signEcdsa(privkey, buffer, ISO7816.OFFSET_CDATA);
+    }
+
+    /****************************************
+     *      Self-built ECDSA (BIP461)       *
+     ****************************************/
+
+    /*
+     * ECDSA assembled by the applet, replacing Signature.ALG_ECDSA_SHA_256 for the wallet keys.
+     *
+     * The platform Signature engine picks the nonce k itself, in a way that cannot be observed
+     * or checked. Here every step is explicit, as specified in BIP461
+     * (https://github.com/bitcoin/bips/blob/master/bip-0461.md, reference.py):
+     *
+     *   h = z mod n                                   z: the 32-byte hash to sign, d: the private key
+     *   k = RFC 6979 nonce: HMAC-SHA256 DRBG seeded with d, h (and the grind counter)
+     *   R = k*G,  r = x(R) mod n                      retried with the next counter while r >= 2^255
+     *   s = k^-1 * (h + r*d) mod n,  s = min(s, n-s)
+     *
+     * The card's random generator does not enter the signature: (r, s) only depends on (d, z).
+     *
+     * The platform still does the heavy arithmetic, but no engine is given k or d:
+     *   - R = k*G is split: w is random, Q = w*G, k' = k * w^-1 mod n, R = k' * Q. The EC engine
+     *     sees w and k', each of which is uniformly random on its own.
+     *   - k^-1 is blinded: b is random, u = k*b, v = (h + r*d)*b, s = v * u^-1. The inversion
+     *     engine sees u (and w), not k.
+     *   - the modular multiplications run on the RSA squaring engine with the secret operand
+     *     replaced by x + m*n for a fresh random m (blindScalar()).
+     *   - the HMAC is assembled on Sha256: with its bytecode backend d and k do not enter a
+     *     platform primitive at all; with its platform backend the SHA-256 engine hashes them.
+     * Known limit: a platform that recorded both w and k' could recombine them into k.
+     *
+     * Scratch map while signing. recvBuffer (secrets, all erased in the finally block):
+     *   [  0.. 96) ACC    accumulator of the modular multiplications; result in its last 32 bytes
+     *   [ 96..128) D      private key d
+     *   [128..160) H      h = z mod n
+     *   [160..192) HK     RFC 6979 state K
+     *   [192..224) K      RFC 6979 state V, which is the nonce k once derived
+     *   [224..256) X      grind counter block, then w, then b
+     * APDU buffer (the hash to sign has been copied out before):
+     *   [  0.. 65) Q      Q = w*G, later the public key P
+     *   [ 65..130) R      R, with r = x(R) mod n at [66..98)
+     *   [130..194) INV    in/out block of the inversion engine, value in its last 32 bytes
+     *   [194..226) T      k', then h + r*d, then s
+     *   [226..258) V      v, later u1
+     * tmpBuffer: scratch of blindScalar() [0..222) and of HmacSha256 [0..96), never both at once.
+     */
+    private static final short ECDSA_OFFSET_ACC = (short)0;
+    private static final short ECDSA_OFFSET_PRODUCT = (short)64; // last 32 bytes of ACC
+    private static final short ECDSA_OFFSET_D = (short)96;
+    private static final short ECDSA_OFFSET_H = (short)128;
+    private static final short ECDSA_OFFSET_HK = (short)160;
+    private static final short ECDSA_OFFSET_K = (short)192;
+    private static final short ECDSA_OFFSET_X = (short)224;
+    private static final short ECDSA_SECRETS_END = (short)256;
+    private static final short ECDSA_APDU_Q = (short)0;
+    private static final short ECDSA_APDU_R = (short)65;
+    private static final short ECDSA_APDU_INV = (short)130;
+    private static final short ECDSA_APDU_T = (short)194;
+    private static final short ECDSA_APDU_V = (short)226;
+    private static final short ECDSA_APDU_SIZE = (short)258;
+    /**
+     * Low-r grinding stops after this many nonces. Each one has probability 1/2 of giving a
+     * low r, so the limit is hit with probability 2^-64 on a working card: it only exists so
+     * that a broken platform cannot make the card loop forever.
+     */
+    private static final short ECDSA_GRIND_LIMIT = (short)64;
+    /** Same purpose for the retries on an invalid nonce or a null r or s, which are unreachable. */
+    private static final short ECDSA_RETRY_LIMIT = (short)4;
+    private static final byte[] ECDSA_RFC6979_SEPARATORS = {(byte)0x00, (byte)0x01};
+
+    /**
+     * Signs the 32-byte hash at buffer[hashOffset] with privkey, as specified in BIP461, and
+     * writes the DER-encoded signature at buffer[0].
+     * The caller has done all the access control (PIN, 2FA, key selection).
+     * Uses buffer[0..258), recvBuffer, tmpBuffer, the Biginteger buffers and the scratch EC key.
+     * @return the size of the signature
+     */
+    private short signEcdsa(ECPrivateKey privkey, byte[] buffer, short hashOffset) {
+        if ((short)buffer.length < ECDSA_APDU_SIZE)
+            ISOException.throwIt(SW_INTERNAL_ERROR);
+
+        // from here on, the scratch buffers hold secrets: they are erased in the finally block
+        // below, also on error. buffer[0..sizeout) is kept on success (the signature).
+        short sizeout = (short)0;
+        try {
+            // h = z mod n. z < 2^256 < 2n, so one conditional subtraction is enough. z is public.
+            Util.arrayCopyNonAtomic(buffer, hashOffset, recvBuffer, ECDSA_OFFSET_H, (short)32);
+            reduceModOrder(recvBuffer, ECDSA_OFFSET_H);
+
+            // d must be in [1, n-1] (ImportKey and the BIP32 derivation already guarantee it)
+            privkey.getS(recvBuffer, ECDSA_OFFSET_D);
+            if (Biginteger.isZeroCT(recvBuffer, ECDSA_OFFSET_D, (short)32)
+                    | !Biginteger.lessThanCT(recvBuffer, ECDSA_OFFSET_D, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32))
+                ISOException.throwIt(SW_INCORRECT_ALG);
+
+            // BIP461 deterministic_sign(): grind counter 0 uses no extra data; while r >= 2^255
+            // the nonce derivation is restarted with the next counter. Only k and R are computed
+            // for the nonces that are thrown away.
+            boolean signed = false;
+            for (short grind = (short)0; !signed; grind++) {
+                if (grind >= ECDSA_GRIND_LIMIT)
+                    ISOException.throwIt(SW_ECDSA_NONCE_ERROR);
+                rfc6979Init(grind);
+                // BIP461 sign(): the next output of the generator is taken when the nonce is not
+                // in [1, n-1], or when r or s is 0. None of these can be reached in practice.
+                for (short retry = (short)0; ; retry++) {
+                    if (retry >= ECDSA_RETRY_LIMIT)
+                        ISOException.throwIt(SW_ECDSA_NONCE_ERROR);
+                    // k is secret: constant-time checks, and no short-circuit between them
+                    if (!Biginteger.isZeroCT(recvBuffer, ECDSA_OFFSET_K, (short)32)
+                            & Biginteger.lessThanCT(recvBuffer, ECDSA_OFFSET_K, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32)) {
+                        ecdsaComputeR(buffer);
+                        // r is public from here on
+                        if (!Biginteger.equalZero(buffer, (short)(ECDSA_APDU_R+1), (short)32)) {
+                            if ((buffer[(short)(ECDSA_APDU_R+1)] & (byte)0x80) != (byte)0)
+                                break; // r >= 2^255: grind
+                            ecdsaComputeS(buffer);
+                            if (!Biginteger.isZeroCT(buffer, ECDSA_APDU_T, (short)32)) {
+                                signed = true;
+                                break;
+                            }
+                        }
+                    }
+                    rfc6979Next();
+                }
+            }
+
+            // (r, s) is the signature: nothing secret is needed anymore
+            Util.arrayFillNonAtomic(recvBuffer, ECDSA_OFFSET_D, (short)32, (byte)0);
+            Util.arrayFillNonAtomic(recvBuffer, ECDSA_OFFSET_HK, (short)(ECDSA_SECRETS_END-ECDSA_OFFSET_HK), (byte)0);
+            Util.arrayFillNonAtomic(buffer, ECDSA_APDU_V, (short)32, (byte)0);
+
+            // low-S: s = min(s, n-s) (n is odd, so the two differ)
+            Util.arrayCopyNonAtomic(Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, recvBuffer, ECDSA_OFFSET_ACC, (short)32);
+            Biginteger.subtract(recvBuffer, ECDSA_OFFSET_ACC, buffer, ECDSA_APDU_T, (short)32);
+            if (Biginteger.lessThan(recvBuffer, ECDSA_OFFSET_ACC, buffer, ECDSA_APDU_T, (short)32))
+                Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_ACC, buffer, ECDSA_APDU_T, (short)32);
+            // DER: 30 len 02 len(r) r 02 len(s) s, built aside since it overlaps r in the APDU buffer
+            short offset = (short)(ECDSA_OFFSET_ACC+2);
+            offset = derInteger(buffer, (short)(ECDSA_APDU_R+1), recvBuffer, offset);
+            offset = derInteger(buffer, ECDSA_APDU_T, recvBuffer, offset);
+            recvBuffer[ECDSA_OFFSET_ACC] = (byte)0x30;
+            recvBuffer[(short)(ECDSA_OFFSET_ACC+1)] = (byte)(offset - (short)(ECDSA_OFFSET_ACC+2));
+            sizeout = (short)(offset - ECDSA_OFFSET_ACC);
+            Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_ACC, buffer, (short)0, sizeout);
+        } finally {
+            Sha256.clear();
+            clearSigningScratch(buffer, sizeout, ECDSA_APDU_SIZE);
+        }
+        return sizeout;
+    }
+
+    /** x = x mod n for a public 32-byte x: x < 2^256 < 2n, so n is subtracted at most once. */
+    private static void reduceModOrder(byte[] x, short xOff) {
+        if (!Biginteger.lessThan(x, xOff, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32))
+            Biginteger.subtract(x, xOff, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32);
+    }
+
+    /**
+     * Starts the RFC 6979 generator (section 3.2, steps b to h) for the given grind counter and
+     * leaves the first nonce candidate in K. As in BIP461 nonce_rfc6979():
+     *   V = 0x01 * 32, K = 0x00 * 32
+     *   K = HMAC(K, V | 0x00 | d | h | extra),  V = HMAC(K, V)
+     *   K = HMAC(K, V | 0x01 | d | h | extra),  V = HMAC(K, V)
+     *   V = HMAC(K, V)                           the candidate
+     * extra is empty for counter 0, else the counter on 4 bytes little endian followed by 28 zeros.
+     */
+    private void rfc6979Init(short grind) {
+        Util.arrayFillNonAtomic(recvBuffer, ECDSA_OFFSET_HK, (short)32, (byte)0x00);
+        Util.arrayFillNonAtomic(recvBuffer, ECDSA_OFFSET_K, (short)32, (byte)0x01);
+        Util.arrayFillNonAtomic(recvBuffer, ECDSA_OFFSET_X, (short)32, (byte)0x00);
+        recvBuffer[ECDSA_OFFSET_X] = (byte)grind;
+        recvBuffer[(short)(ECDSA_OFFSET_X+1)] = (byte)(grind >> 8);
+        for (short i = (short)0; i < (short)2; i++) {
+            HmacSha256.begin(recvBuffer, ECDSA_OFFSET_HK);
+            HmacSha256.update(recvBuffer, ECDSA_OFFSET_K, (short)32);
+            HmacSha256.update(ECDSA_RFC6979_SEPARATORS, i, (short)1);
+            HmacSha256.update(recvBuffer, ECDSA_OFFSET_D, (short)32);
+            HmacSha256.update(recvBuffer, ECDSA_OFFSET_H, (short)32);
+            if (grind != (short)0)
+                HmacSha256.update(recvBuffer, ECDSA_OFFSET_X, (short)32);
+            HmacSha256.finish(recvBuffer, ECDSA_OFFSET_HK, recvBuffer, ECDSA_OFFSET_HK);
+            rfc6979UpdateV();
+        }
+        rfc6979UpdateV();
+    }
+
+    /** V = HMAC(K, V) */
+    private void rfc6979UpdateV() {
+        HmacSha256.begin(recvBuffer, ECDSA_OFFSET_HK);
+        HmacSha256.update(recvBuffer, ECDSA_OFFSET_K, (short)32);
+        HmacSha256.finish(recvBuffer, ECDSA_OFFSET_HK, recvBuffer, ECDSA_OFFSET_K);
+    }
+
+    /** Next candidate of the generator: K = HMAC(K, V | 0x00), V = HMAC(K, V), V = HMAC(K, V). */
+    private void rfc6979Next() {
+        HmacSha256.begin(recvBuffer, ECDSA_OFFSET_HK);
+        HmacSha256.update(recvBuffer, ECDSA_OFFSET_K, (short)32);
+        HmacSha256.update(ECDSA_RFC6979_SEPARATORS, (short)0, (short)1);
+        HmacSha256.finish(recvBuffer, ECDSA_OFFSET_HK, recvBuffer, ECDSA_OFFSET_HK);
+        rfc6979UpdateV();
+        rfc6979UpdateV();
+    }
+
+    /** Draws a uniformly random scalar in [1, n-1] (rejection sampling) at dst[dstOff]. */
+    private void randomScalar(byte[] dst, short dstOff) {
+        do {
+            randomData.generateData(dst, dstOff, (short)32);
+        } while (Biginteger.isZeroCT(dst, dstOff, (short)32)
+                | !Biginteger.lessThanCT(dst, dstOff, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32));
+    }
+
+    /**
+     * recvBuffer[ECDSA_OFFSET_PRODUCT..+32) = a * x mod n, where x is a secret 32-byte scalar,
+     * blinded as x + m*n before it is multiplied, and a is a 32-byte value that is public or
+     * random. a and x must lie outside ACC and outside tmpBuffer.
+     */
+    private void mulModOrder(byte[] a, short aOff, byte[] x, short xOff) {
+        Util.arrayFillNonAtomic(recvBuffer, ECDSA_OFFSET_ACC, BIGNUM_SIZE, (byte)0);
+        blindedMulAdd(recvBuffer, ECDSA_OFFSET_ACC, a, aOff, x, xOff);
+        Biginteger.mod(recvBuffer, ECDSA_OFFSET_ACC, BIGNUM_SIZE, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32);
+    }
+
+    /** Replaces the 32-byte x at buffer[ECDSA_APDU_INV+32] with x^-1 mod n (see Biginteger.modInv()). */
+    private static void invertModOrder(byte[] buffer) {
+        Util.arrayFillNonAtomic(buffer, ECDSA_APDU_INV, (short)32, (byte)0);
+        Biginteger.modInv(buffer, ECDSA_APDU_INV);
+    }
+
+    /**
+     * R = k*G without handing k to the EC engine: Q = w*G for a fresh random w, then
+     * R = (k * w^-1) * Q. Leaves R at buffer[ECDSA_APDU_R] and reduces its x coordinate to
+     * r = x(R) mod n in place.
+     */
+    private void ecdsaComputeR(byte[] buffer) {
+        // Q = w*G
+        randomScalar(recvBuffer, ECDSA_OFFSET_X);
+        setEphemeralScalar(recvBuffer, ECDSA_OFFSET_X);
+        getPublicKey(ephemeral_privkey, buffer, ECDSA_APDU_Q);
+        // w^-1
+        Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_X, buffer, (short)(ECDSA_APDU_INV+32), (short)32);
+        invertModOrder(buffer);
+        // k' = k * w^-1 mod n, with k blinded. k' is not 0: neither factor is.
+        mulModOrder(buffer, (short)(ECDSA_APDU_INV+32), recvBuffer, ECDSA_OFFSET_K);
+        Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_PRODUCT, buffer, ECDSA_APDU_T, (short)32);
+        // R = k' * Q
+        setEphemeralScalar(buffer, ECDSA_APDU_T);
+        keyAgreement.init(ephemeral_privkey);
+        keyAgreement.generateSecret(buffer, ECDSA_APDU_Q, (short)65, buffer, ECDSA_APDU_R);
+        // r = x(R) mod n
+        reduceModOrder(buffer, (short)(ECDSA_APDU_R+1));
+    }
+
+    /**
+     * s = k^-1 * (h + r*d) mod n without inverting k itself: for a fresh random b,
+     * u = k*b, v = (h + r*d)*b, s = v * u^-1. b cancels out, so s only depends on k, d and h.
+     * Leaves s at buffer[ECDSA_APDU_T].
+     */
+    private void ecdsaComputeS(byte[] buffer) {
+        // u = b*k, then u^-1
+        randomScalar(recvBuffer, ECDSA_OFFSET_X);
+        mulModOrder(recvBuffer, ECDSA_OFFSET_X, recvBuffer, ECDSA_OFFSET_K);
+        Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_PRODUCT, buffer, (short)(ECDSA_APDU_INV+32), (short)32);
+        invertModOrder(buffer);
+        // t = h + r*d mod n, with d blinded
+        Util.arrayFillNonAtomic(recvBuffer, ECDSA_OFFSET_ACC, BIGNUM_SIZE, (byte)0);
+        Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_H, recvBuffer, ECDSA_OFFSET_PRODUCT, (short)32);
+        blindedMulAdd(recvBuffer, ECDSA_OFFSET_ACC, buffer, (short)(ECDSA_APDU_R+1), recvBuffer, ECDSA_OFFSET_D);
+        Biginteger.mod(recvBuffer, ECDSA_OFFSET_ACC, BIGNUM_SIZE, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32);
+        Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_PRODUCT, buffer, ECDSA_APDU_T, (short)32);
+        // v = b*t mod n, with t blinded
+        mulModOrder(recvBuffer, ECDSA_OFFSET_X, buffer, ECDSA_APDU_T);
+        Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_PRODUCT, buffer, ECDSA_APDU_V, (short)32);
+        // s = u^-1 * v mod n, with v blinded
+        mulModOrder(buffer, (short)(ECDSA_APDU_INV+32), buffer, ECDSA_APDU_V);
+        Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_PRODUCT, buffer, ECDSA_APDU_T, (short)32);
+    }
+
+    /**
+     * Appends the DER INTEGER encoding of the positive 32-byte number at src[srcOff] to
+     * dst[dstOff]: tag 0x02, length, then the shortest big-endian form (a leading 0x00 only
+     * when the top bit would otherwise be set). The number is public and not 0.
+     * @return the offset following the encoding
+     */
+    private static short derInteger(byte[] src, short srcOff, byte[] dst, short dstOff) {
+        short skip = (short)0;
+        while (skip < (short)31 && src[(short)(srcOff+skip)] == (byte)0)
+            skip++;
+        short size = (short)(32 - skip);
+        boolean pad = (src[(short)(srcOff+skip)] & (byte)0x80) != (byte)0;
+        dst[dstOff++] = (byte)0x02;
+        dst[dstOff++] = (byte)(pad ? (short)(size+1) : size);
+        if (pad)
+            dst[dstOff++] = (byte)0x00;
+        Util.arrayCopyNonAtomic(src, (short)(srcOff+skip), dst, dstOff, size);
+        return (short)(dstOff+size);
     }
 
     /****************************************

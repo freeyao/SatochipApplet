@@ -23,6 +23,7 @@ import java.security.Security;
 import java.security.Signature;
 import java.util.Arrays;
 import java.util.HashSet;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -880,6 +881,109 @@ public class SatochipTest {
     // A hash of the wrong length must be refused rather than silently padded.
     assertNotEquals(SW_OK,
         cmdSet.sendRawSecure(INS_SIGN_TRANSACTION_HASH, 0xFF, 0x00, new byte[16]).getSw());
+  }
+
+  // ---- self-built ECDSA (BIP461) ----------------------------------------------------------------
+
+  /** Keyslot used by the BIP461 tests; they leave it empty. */
+  static final int BIP461_SLOT = 14;
+
+  /** Imports a plain key into a keyslot (2FA off), replacing whatever an interrupted run left there. */
+  static int importSlotKey(TestSatochipCommandSet cmd, int slot, byte[] privkey) {
+    byte[] blob = concat(new byte[]{0x00, 12, 0x01, 0x00}, new byte[6], new byte[]{0x00, 0x20}, privkey);
+    int sw = cmd.sendRawSecure(INS_IMPORT_KEY, slot, 0x00, blob).getSw();
+    if (sw == SW_ECKEYS_INITIALIZED_KEY) {
+      assertEquals(SW_OK, cmd.sendRawSecure(INS_RESET_KEY, slot, 0x00, new byte[0]).getSw());
+      sw = cmd.sendRawSecure(INS_IMPORT_KEY, slot, 0x00, blob).getSw();
+    }
+    return sw;
+  }
+
+  /**
+   * Signs the first {@code count} BIP461 vectors on the card, each with its key imported into
+   * {@code slot}, and requires the signature to be byte-identical to the vector, canonically
+   * DER-encoded, low-r and low-S. The slot is left empty.
+   */
+  static void checkBip461Vectors(TestSatochipCommandSet cmd, int slot, int count) throws Exception {
+    List<Bip461.Vector> vectors = Bip461.vectors();
+    assertTrue(vectors.size() >= count, "vector file too short");
+    try {
+      for (int i = 0; i < count; i++) {
+        Bip461.Vector v = vectors.get(i);
+        String id = "vector " + i + " (" + v.comment + ")";
+        assertEquals(SW_OK, importSlotKey(cmd, slot, v.seckey), "import, " + id);
+        APDUResponse r = cmd.sendRawSecure(INS_SIGN_TRANSACTION_HASH, slot, 0x00, v.msghash);
+        assertEquals(SW_OK, r.getSw(), "sign, " + id);
+        byte[] rs = Bip461.parseStrictDer(r.getData());
+        assertArrayEquals(v.sig, rs, id);
+        assertTrue(Bip461.isLowR(rs), "low-r, " + id);
+        assertTrue(Bip461.isLowS(rs), "low-S, " + id);
+        assertEquals(SW_OK, cmd.sendRawSecure(INS_RESET_KEY, slot, 0x00, new byte[0]).getSw(), "reset, " + id);
+      }
+    } finally {
+      cmd.sendRawSecure(INS_RESET_KEY, slot, 0x00, new byte[0]); // no-op when the loop completed
+    }
+  }
+
+  @Test
+  @DisplayName("The host transcription of the BIP461 reference reproduces every signing vector")
+  void bip461HostReferenceTest() throws Exception {
+    List<Bip461.Vector> vectors = Bip461.vectors();
+    assertTrue(vectors.size() >= 303, "the 3 official vectors and 300 generated ones are expected");
+    for (int i = 0; i < vectors.size(); i++) {
+      Bip461.Vector v = vectors.get(i);
+      assertArrayEquals(v.sig, Bip461.deterministicSign(v.seckey, v.msghash), "vector " + i);
+    }
+  }
+
+  @Test
+  @DisplayName("SIGN TRANSACTION HASH is byte-identical to the BIP461 vectors (keyslot keys)")
+  void signTransactionHashBip461VectorsTest() throws Exception {
+    // The file starts with the 3 official vectors (grinding up to counter 7, msghash >= n,
+    // msghash = 0 mod n) and 5 edge cases; a card takes seconds per signature, so it stops there.
+    int count = TARGET == TARGET_SIMULATOR ? Bip461.vectors().size() : 8;
+    checkBip461Vectors(cmdSet, BIP461_SLOT, count);
+  }
+
+  @Test
+  @DisplayName("SIGN TRANSACTION HASH is deterministic and matches BIP461 for a BIP32 key")
+  void signTransactionHashBip32DeterministicTest() throws Exception {
+    byte[] pub = cmdSet.cardBip32GetExtendedKeyRaw("m/44'/0'/0'/0/0");
+    DeterministicKey key = HDKeyDerivation.createMasterPrivateKey(Vectors.BIP32_SEED);
+    for (ChildNumber c : new ChildNumber[]{new ChildNumber(44, true), new ChildNumber(0, true),
+        new ChildNumber(0, true), new ChildNumber(0, false), new ChildNumber(0, false)}) {
+      key = HDKeyDerivation.deriveChildKey(key, c);
+    }
+    assertArrayEquals(key.getPubKeyPoint().getEncoded(false), pub, "the card and bitcoinj derive the same key");
+    byte[] seckey = Bip461.fixed32(key.getPrivKey());
+
+    for (int i = 0; i < 4; i++) {
+      byte[] hash = sha256(("bip461 with a bip32 key " + i).getBytes());
+      APDUResponse first = cmdSet.sendRawSecure(INS_SIGN_TRANSACTION_HASH, 0xFF, 0x00, hash);
+      APDUResponse second = cmdSet.sendRawSecure(INS_SIGN_TRANSACTION_HASH, 0xFF, 0x00, hash);
+      assertEquals(SW_OK, first.getSw());
+      assertEquals(SW_OK, second.getSw());
+      assertArrayEquals(first.getData(), second.getData(), "same key, same hash: same signature");
+      assertArrayEquals(Bip461.deterministicSign(seckey, hash), Bip461.parseStrictDer(first.getData()),
+          "the signature is the BIP461 one");
+      assertTrue(verifyEcdsa(pub, hash, first.getData()));
+    }
+  }
+
+  @Test
+  @DisplayName("The invalid private keys of the BIP461 vectors (0, n, p) cannot be imported")
+  void bip461InvalidKeysTest() {
+    String[] invalid = {
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141",
+        "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f"};
+    byte[] hash = Hex.decode("ec888dbfce53624100e889809bce7d3cbe677b56a15968c5964d8d3690f57bff");
+    for (String k : invalid) {
+      assertEquals(SW_INVALID_PARAMETER, importSlotKey(cmdSet, BIP461_SLOT, Hex.decode(k)), k);
+      assertEquals(SW_INCORRECT_P1,
+          cmdSet.sendRawSecure(INS_SIGN_TRANSACTION_HASH, BIP461_SLOT, 0x00, hash).getSw(),
+          "the slot must still be empty");
+    }
   }
 
   @Test
