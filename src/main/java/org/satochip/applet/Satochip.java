@@ -210,6 +210,8 @@ public class Satochip extends javacard.framework.Applet {
     
     // reset to factory settings v3
     private final static byte INS_RESET_TO_FACTORY_V3 = (byte) 0xFD;
+    /** MEASUREMENT BUILD ONLY (branch betternonce-bytecode-mul): times arithmetic primitives. Not for release. */
+    private final static byte INS_BENCH_ARITHMETIC = (byte) 0xBB;
     
     /****************************************
      *          Error codes                 *
@@ -1102,6 +1104,9 @@ public class Satochip extends javacard.framework.Applet {
             break;
         case INS_RESET_TO_FACTORY_V3:
             sizeout= resetToFactory(apdu, buffer);
+            break;
+        case INS_BENCH_ARITHMETIC:
+            sizeout= benchArithmetic(apdu, buffer);
             break;
         default:
             ISOException.throwIt(ISO7816.SW_INS_NOT_SUPPORTED);
@@ -2912,6 +2917,75 @@ public class Satochip extends javacard.framework.Applet {
             randomData.generateData(dst, dstOff, (short)32);
         } while (Biginteger.isZeroCT(dst, dstOff, (short)32)
                 | !Biginteger.lessThanCT(dst, dstOff, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32));
+    }
+
+    /**
+     * MEASUREMENT BUILD ONLY: runs one arithmetic primitive `count` times on the given operands,
+     * so that a host can time it (time(count=N) - time(count=1)) / (N-1), and returns the last
+     * result so that the host can check it. No PIN: the operands are test values, no key is used.
+     *
+     * ins: 0xBB
+     * p1: operation
+     *      0: nothing (overhead of the command itself)                       return [00]
+     *      1: bytecode multiplication a*b                                    return 64 bytes
+     *      2: bytecode multiplication, then Biginteger.mod (generic)         return a*b mod n
+     *      3: mulModOrder(): blinded RSA squaring + Biginteger.mod (current) return a*b mod n
+     *      4: Biginteger.mod alone, on the 64 bytes a|b                      return (a|b) mod n
+     *      5: bytecode multiplication, then mod_order_bytecode (folding)     return a*b mod n
+     *      6: mod_order_bytecode alone, on the 64 bytes a|b                  return (a|b) mod n
+     * p2: count (1..255)
+     * data: [a(32b) | b(32b)]
+     */
+    private short benchArithmetic(APDU apdu, byte[] buffer) {
+        short bytesLeft = Util.makeShort((byte) 0x00, buffer[ISO7816.OFFSET_LC]);
+        if (bytesLeft < (short)64)
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        byte op = buffer[ISO7816.OFFSET_P1];
+        short count = (short)(buffer[ISO7816.OFFSET_P2] & 0xFF);
+        if (count == (short)0)
+            ISOException.throwIt(SW_INCORRECT_P2);
+        // a at ecdsaRam[0..32), b at ecdsaRam[32..64): outside recvBuffer, tmpBuffer and the Biginteger buffers
+        Util.arrayCopyNonAtomic(buffer, ISO7816.OFFSET_CDATA, ecdsaRam, (short)0, (short)64);
+        short resOff = (short)0;
+        short resLen = (short)1;
+        recvBuffer[0] = (byte)0;
+        for (short i = (short)0; i < count; i++) {
+            switch (op) {
+            case (byte)0:
+                break;
+            case (byte)1:
+                Biginteger.mult_bytecode(ecdsaRam, (short)0, (short)32, ecdsaRam, (short)32, (short)32, recvBuffer, (short)0);
+                resLen = (short)64;
+                break;
+            case (byte)2:
+                Biginteger.mult_bytecode(ecdsaRam, (short)0, (short)32, ecdsaRam, (short)32, (short)32, recvBuffer, (short)0);
+                Biginteger.mod(recvBuffer, (short)0, (short)64, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32);
+                resOff = (short)32; resLen = (short)32;
+                break;
+            case (byte)3:
+                mulModOrder(ecdsaRam, (short)0, ecdsaRam, (short)32);
+                resOff = ECDSA_OFFSET_PRODUCT; resLen = (short)32;
+                break;
+            case (byte)4:
+                Util.arrayCopyNonAtomic(ecdsaRam, (short)0, recvBuffer, (short)0, (short)64);
+                Biginteger.mod(recvBuffer, (short)0, (short)64, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32);
+                resOff = (short)32; resLen = (short)32;
+                break;
+            case (byte)5:
+                Biginteger.mult_bytecode(ecdsaRam, (short)0, (short)32, ecdsaRam, (short)32, (short)32, recvBuffer, (short)0);
+                Biginteger.mod_order_bytecode(recvBuffer, (short)0, recvBuffer, (short)64);
+                resOff = (short)64; resLen = (short)32;
+                break;
+            case (byte)6:
+                Biginteger.mod_order_bytecode(ecdsaRam, (short)0, recvBuffer, (short)0);
+                resLen = (short)32;
+                break;
+            default:
+                ISOException.throwIt(SW_INCORRECT_P1);
+            }
+        }
+        Util.arrayCopyNonAtomic(recvBuffer, resOff, buffer, (short)0, resLen);
+        return resLen;
     }
 
     /**

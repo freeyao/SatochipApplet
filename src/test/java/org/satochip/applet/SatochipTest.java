@@ -946,6 +946,52 @@ public class SatochipTest {
   }
 
   @Test
+  @DisplayName("Measurement build: the bytecode multiplication and reductions give the right results")
+  void benchArithmeticTest() throws Exception {
+    java.math.BigInteger n = Vectors.SECP256K1_N;
+    java.math.BigInteger m = java.math.BigInteger.ONE.shiftLeft(256);
+    java.util.List<java.math.BigInteger> values = new java.util.ArrayList<>(java.util.Arrays.asList(
+        java.math.BigInteger.ZERO, java.math.BigInteger.ONE, m.subtract(java.math.BigInteger.ONE), n,
+        n.subtract(java.math.BigInteger.ONE), n.add(java.math.BigInteger.ONE), m.subtract(n)));
+    for (int i = 0; i < 6; i++) {
+      values.add(new java.math.BigInteger(1, sha256(("bench value " + i).getBytes())));
+    }
+    for (int i = 0; i < values.size(); i++) {
+      java.math.BigInteger a = values.get(i);
+      java.math.BigInteger b = values.get((i * 5 + 3) % values.size());
+      byte[] ab = concat(fixed(a, 32), fixed(b, 32));
+      java.math.BigInteger product = a.multiply(b);
+      java.math.BigInteger joined = new java.math.BigInteger(1, ab);
+      for (int count : new int[]{1, 3}) {
+        String id = "values " + i + ", count " + count;
+        assertArrayEquals(new byte[]{0}, bench(0, count, ab), "op 0, " + id);
+        assertArrayEquals(fixed(product, 64), bench(1, count, ab), "op 1, " + id);
+        assertArrayEquals(fixed(product.mod(n), 32), bench(2, count, ab), "op 2, " + id);
+        assertArrayEquals(fixed(product.mod(n), 32), bench(3, count, ab), "op 3, " + id);
+        assertArrayEquals(fixed(joined.mod(n), 32), bench(4, count, ab), "op 4, " + id);
+        assertArrayEquals(fixed(product.mod(n), 32), bench(5, count, ab), "op 5, " + id);
+        assertArrayEquals(fixed(joined.mod(n), 32), bench(6, count, ab), "op 6, " + id);
+      }
+    }
+    // the signing path is untouched by the measurement command
+    checkBip461Vectors(cmdSet, BIP461_SLOT, 3);
+  }
+
+  private byte[] bench(int op, int count, byte[] ab) {
+    APDUResponse r = cmdSet.sendRawSecure(0xBB, op, count, ab);
+    assertEquals(SW_OK, r.getSw(), "bench op " + op);
+    return r.getData();
+  }
+
+  private static byte[] fixed(java.math.BigInteger v, int size) {
+    byte[] raw = v.toByteArray();
+    byte[] out = new byte[size];
+    int len = Math.min(raw.length, size);
+    System.arraycopy(raw, raw.length - len, out, size - len, len);
+    return out;
+  }
+
+  @Test
   @DisplayName("SIGN TRANSACTION HASH is deterministic and matches BIP461 for a BIP32 key")
   void signTransactionHashBip32DeterministicTest() throws Exception {
     byte[] pub = cmdSet.cardBip32GetExtendedKeyRaw("m/44'/0'/0'/0/0");
