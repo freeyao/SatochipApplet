@@ -1057,6 +1057,17 @@ public class SatochipTest {
       assertEquals(SW_INCORRECT_P1, cmdSet.sendRawSecure(ins, BIP461_SLOT - 1, ANTIEXFIL_INIT, initData).getSw(),
           "empty keyslot");
 
+      // a "commitment" that is a BIP461 grinding counter block (4 bytes, then 28 zeros) would
+      // make R0 the nonce point of SignTransactionHash: refused, whatever the counter
+      for (int counter : new int[] {0, 1, 2, 0x01020304}) {
+        byte[] block = new byte[32];
+        block[0] = (byte) counter; block[1] = (byte) (counter >> 8); block[2] = (byte) (counter >> 16); block[3] = (byte) (counter >> 24);
+        assertEquals(SW_ECDSA_ANTIEXFIL_COMMITMENT, cmdSet.sendRawSecure(ins, BIP461_SLOT, ANTIEXFIL_INIT, concat(v.msghash, block)).getSw(),
+            "grinding counter block " + counter + " as commitment");
+      }
+      assertEquals(SW_INCORRECT_INITIALIZATION, cmdSet.sendRawSecure(ins, BIP461_SLOT, ANTIEXFIL_FINALIZE, v.rho).getSw(),
+          "a refused INIT leaves nothing pending");
+
       // the first step is deterministic: a host that retries gets the same R0
       APDUResponse init = cmdSet.sendRawSecure(ins, BIP461_SLOT, ANTIEXFIL_INIT, initData);
       assertEquals(SW_OK, init.getSw());

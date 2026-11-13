@@ -309,9 +309,9 @@ public class Satochip extends javacard.framework.Applet {
     /** Taproot very low probability error*/
     private final static short SW_TAPROOT_TWEAK_ERROR = (short) 0x9C43;
     private final static short SW_SCHNORR_INVALID_NONCE = (short) 0x9C4C;
-    /** Self-built ECDSA: the signature just computed does not verify (computation error or fault injection): nothing is returned */
+    /** Self-built ECDSA: the signature just computed does not verify, or two copies of a value that must be equal differ (computation error or fault injection): nothing is returned */
     private final static short SW_ECDSA_VERIFY_FAILED = (short) 0x9C4D;
-    /** Self-built ECDSA: no acceptable nonce was found within the attempt limits (not expected to happen) */
+    /** Self-built ECDSA: no acceptable nonce within 64 grind counters, or 4 unacceptable candidates or random draws in a row (not expected to happen) */
     private final static short SW_ECDSA_NONCE_ERROR = (short) 0x9C4E;
     /** Anti-exfil ECDSA: the host randomness revealed in the second step does not match the commitment of the first step */
     private final static short SW_ECDSA_ANTIEXFIL_COMMITMENT = (short) 0x9C4F;
@@ -1458,13 +1458,15 @@ public class Satochip extends javacard.framework.Applet {
      * Called from a finally block, so that error exits are covered too.
      */
     private void clearSigningScratch(byte[] buffer, short from, short to){
-        clearEphemeralKey();
         Util.arrayFillNonAtomic(buffer, from, (short)(to-from), (byte)0);
         Util.arrayFillNonAtomic(recvBuffer, (short)0, (short)recvBuffer.length, (byte)0);
         Util.arrayFillNonAtomic(tmpBuffer, (short)0, (short)tmpBuffer.length, (byte)0);
         Util.arrayFillNonAtomic(ecdsaRam, (short)0, ECDSA_RAM_SIZE, (byte)0);
         Util.arrayFillNonAtomic(Biginteger.buffer1, (short)0, (short)Biginteger.buffer1.length, (byte)0);
         Util.arrayFillNonAtomic(Biginteger.buffer2, (short)0, (short)Biginteger.buffer2.length, (byte)0);
+        // last: on a card where the scratch key is persistent this is a write to EEPROM, and
+        // if it throws, the buffers above are already erased
+        clearEphemeralKey();
     }
 
     /**
@@ -1472,7 +1474,8 @@ public class Satochip extends javacard.framework.Applet {
      * key...). On a card without transient EC keys (e.g. JCOP3 P60) the scratch key is a
      * persistent object: clearKey() would also erase its curve parameters, which are only set
      * again before use for transient keys, so its value is overwritten with the scalar 1
-     * instead. Otherwise the last scalar would stay in EEPROM, also across a power cut.
+     * instead. Until that write the scalar is in EEPROM, also across a power cut, and whether
+     * the overwrite physically erases the old value depends on the card.
      */
     private void clearEphemeralKey(){
         if (ephemeral_privkey_transient)
@@ -2669,6 +2672,8 @@ public class Satochip extends javacard.framework.Applet {
      *   [ 64..128) INV    in/out block of the inversion engine, value in its last 32 bytes
      *   [128..160) T      k', then h + r*d, then s
      *   [160..192) V      v, later u1
+     *   [192..224) RHO2   anti-exfil: second copy of rho
+     *   [224..256) T2     anti-exfil: second computation of the commitment, then of the tweak t
      * APDU buffer (the hash to sign has been copied out before), public values only:
      *   [  0.. 65) Q      Q = w*G, later the public key P
      *   [ 65..130) R      R, with r = x(R) mod n at [66..98)
@@ -2676,24 +2681,43 @@ public class Satochip extends javacard.framework.Applet {
      * During the verification (public values only) recvBuffer is reused: X holds u2,
      * [0..65) the point u2*P and [96..161) the point R' = u1*G + u2*P.
      *
-     * Redundancy against a fault in RAM. The nonce is deterministic, so a signature made with a
-     * corrupted h or k next to the correct signature for the same key and hash can give the
-     * private key away, and the verification alone does not see such a corruption when one
-     * stored value feeds both the signature and its check. Therefore:
+     * Redundancy against a fault in RAM. The fault that is considered: during one command, one
+     * bit of one stored value is flipped, at a place and time the attacker chooses, and the
+     * command can be repeated at will. Skipped instructions, several faults in one command and
+     * faults that only affect one read are NOT considered, and nothing here was tested on a card.
+     * The nonce is deterministic, so a signature made with a corrupted h or k next to the
+     * correct signature for the same key and hash can give the private key away, and the
+     * verification alone does not see such a corruption when one stored value feeds both the
+     * signature and its check. Two rules follow:
+     *   1. a value that depends on a secret reaches the signature and its check through two
+     *      separate copies or two separate computations;
+     *   2. nothing the outside can observe (a signature, a point, a refusal, the move to the
+     *      next grind counter) is decided from a secret value before that value has been
+     *      checked against its second copy.
+     * How they are applied:
      *   - h is stored twice, from two separate reads of the command data: s is computed from H,
      *     the verification uses H2. If either copy is altered, the signature does not verify.
-     *   - k is stored twice: R is computed from K, s from K2. If either copy is altered, r and s
-     *     no longer belong to the same nonce and the signature does not verify.
+     *   - k is computed twice: the last step of the nonce derivation, V = HMAC(K, V), is run on
+     *     two copies of its input and gives K and K2 (rfc6979Candidate()). R is computed from
+     *     K, s from K2. A fault before that step gives an unrelated nonce in both; a fault in
+     *     either result is caught by the next point.
+     *   - before R is used, ecdsaComputeR() checks the scalar it hands to the EC engine
+     *     against K2 (k' * w = k) and compares K with K2. Without this, a flipped bit of K or
+     *     of its blinded copy would make the card either refuse (r still low) or move to the
+     *     next grind counter (r turned high), and which of the two happens tells the attacker
+     *     that bit. For the blinded copy k + m*n this matters for the top 8 bits only: with
+     *     m < 2^119 they are those of k up to a borrow (n = 2^256 - c with c < 2^129), which
+     *     is also why the additive blinding does not hide these 8 bits from the RSA engine.
      *   - s is stored twice: the verification reads S2, the output is encoded from T, and the
      *     two are compared after the verification. If either copy is altered while the signature
      *     is being checked, nothing is output.
      *   - the verification result is checked twice, and the r that is output is the x coordinate
      *     of the point R' the verification recomputed, not the r that went into it.
-     * Not covered: a fault that alters k between the end of its derivation and the copy to K2
-     * (a few instructions later) changes both copies alike; covering it would take a second
-     * derivation of the nonce, i.e. twice the HMAC work.
-     * A fault that makes a discarded nonce out of a good one (r turned high) only moves the card
-     * to the next grind counter: the result is a valid signature under an unrelated nonce.
+     * Known gaps under that same fault model:
+     *   - after the last comparison, r, s and the DER encoding exist once: a flipped bit there
+     *     is output as an invalid signature (which the attacker could produce himself);
+     *   - the HMAC key of the last derivation step is one stored value read by both
+     *     computations of k: if it is altered before both, k is an unrelated value in both.
      */
     private static final short ECDSA_OFFSET_ACC = (short)0;
     private static final short ECDSA_OFFSET_PRODUCT = (short)64; // last 32 bytes of ACC
@@ -2712,11 +2736,13 @@ public class Satochip extends javacard.framework.Applet {
     private static final short ECDSA_RAM_INV = (short)64;
     private static final short ECDSA_RAM_T = (short)128;
     private static final short ECDSA_RAM_V = (short)160;
-    private static final short ECDSA_RAM_SIZE = (short)192;
+    private static final short ECDSA_RAM_RHO2 = (short)192; // anti-exfil only
+    private static final short ECDSA_RAM_T2 = (short)224;   // anti-exfil only
+    private static final short ECDSA_RAM_SIZE = (short)256;
     /** Scratch of the self-built ECDSA that is neither recvBuffer nor the APDU buffer: RAM only, no persistent fallback. */
     private byte[] ecdsaRam;
     /** The scalar 1: what a persistent scratch key is overwritten with after use (see clearEphemeralKey()). */
-    private static final byte[] SCALAR_ONE = {
+    static final byte[] SCALAR_ONE = {
         0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,(byte)1};
     /**
      * Low-r grinding stops after this many nonces. Each one has probability 1/2 of giving a
@@ -2772,8 +2798,8 @@ public class Satochip extends javacard.framework.Applet {
                     // k is secret: constant-time checks, and no short-circuit between them
                     if (!Biginteger.isZeroCT(recvBuffer, ECDSA_OFFSET_K, (short)32)
                             & Biginteger.lessThanCT(recvBuffer, ECDSA_OFFSET_K, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32)) {
-                        // second copy of k, taken at once: R is computed from K, s from K2
-                        Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_K, ecdsaRam, ECDSA_RAM_K2, (short)32);
+                        // R is computed from K and s from K2; ecdsaComputeR() refuses to go on
+                        // if the two differ
                         ecdsaComputeR(buffer);
                         // r = x(R) mod n is public from here on
                         reduceModOrder(buffer, (short)(ECDSA_APDU_R+1));
@@ -2869,8 +2895,17 @@ public class Satochip extends javacard.framework.Applet {
      *   - k0 is derived again from the RECOMPUTED c, never from the stored one. If the comparison
      *     were skipped by a fault, k0 would not match the stored R0, the signature would not be
      *     valid, and ecdsaVerify() would refuse to output it.
-     * The same k0 can therefore never be combined with two different rho, which is what would
-     * leak the private key.
+     * That covers a skipped comparison. It does not cover a rho that is altered AFTER the
+     * comparison: the tweak t computed from it goes into both k = k0 + t and R = R0 + t*G, which
+     * still fit together, so the signature verifies, and next to a normal signature for the same
+     * (z, c, rho) it gives the private key away (the difference of the two nonces is known).
+     * One rho, two computations: rho is therefore read twice from the command, each copy is
+     * checked against the commitment, and t is computed once from each copy, from separately
+     * assembled hash inputs. One t goes into k, the other into R. A single altered value changes
+     * only one of them, k and R no longer fit, and ecdsaVerify() refuses the signature.
+     * R0 itself is stored once and feeds both t and the point addition: an altered R0 gives a
+     * consistent t but R0' + t*G is not (k0 + t)*G, so the signature does not verify either.
+     * The fault model and its limits are those of "Redundancy" in the scratch map.
      *
      * A host that gets R0 and then an error must retry with the SAME rho and check that the card
      * returns the same R0, otherwise a card could bias the nonce by failing selectively. The
@@ -2948,12 +2983,21 @@ public class Satochip extends javacard.framework.Applet {
                     ISOException.throwIt(SW_SIGNATURE_INVALID);
             }
 
+            // A commitment whose last 28 bytes are zero is refused. BIP461 feeds its grinding
+            // counter to the nonce derivation as 4 bytes followed by 28 zeros: with such a
+            // "commitment" k0 would be a nonce of SignTransactionHash for the same hash, and
+            // this command would hand out its point. A real commitment is a hash (2^-224).
+            if (Biginteger.equalZero(buffer, (short)(ISO7816.OFFSET_CDATA+32+4), (short)28))
+                ISOException.throwIt(SW_ECDSA_ANTIEXFIL_COMMITMENT);
+
             try {
                 // keep z and c (public), then derive k0 = RFC 6979(d, h, extra = c)
                 Util.arrayCopyNonAtomic(buffer, ISO7816.OFFSET_CDATA, antiexfil_state, ANTIEXFIL_OFFSET_Z, (short)64);
                 antiexfil_state[ANTIEXFIL_OFFSET_KEYNB] = key_nb;
                 antiexfilDeriveK0(privkey, antiexfil_state, ANTIEXFIL_OFFSET_C);
-                // R0 = k0*G, by the split multiplication
+                // R0 = k0*G, by the split multiplication. R0 is output, and there is no
+                // signature here whose verification could catch a wrong R0: ecdsaComputeR()
+                // compares the two computations of k0 (K and K2) and throws if they differ.
                 ecdsaComputeR(buffer);
                 Util.arrayCopyNonAtomic(buffer, ECDSA_APDU_R, antiexfil_state, ANTIEXFIL_OFFSET_R0, (short)65);
                 // return R0 compressed
@@ -2981,35 +3025,34 @@ public class Satochip extends javacard.framework.Applet {
             ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
 
         try {
-            // rho, kept in V until t is computed
+            // rho is read twice from the command data: V and RHO2. Everything that follows from
+            // rho is computed once from each copy (see "one rho, two computations" above).
             Util.arrayCopyNonAtomic(buffer, ISO7816.OFFSET_CDATA, ecdsaRam, ECDSA_RAM_V, (short)32);
-            // c' = tagged_hash("s2c/ecdsa/data", rho) must be the commitment of OP_INIT
+            Util.arrayCopyNonAtomic(buffer, ISO7816.OFFSET_CDATA, ecdsaRam, ECDSA_RAM_RHO2, (short)32);
+            // c' = tagged_hash("s2c/ecdsa/data", rho) must be the commitment of OP_INIT, for both copies
             schnorr_hash_tag(ANTIEXFIL_TAGS, (short)0, ANTIEXFIL_TAG_DATA_SIZE, ecdsaRam, ECDSA_RAM_V, (short)32, ecdsaRam, ECDSA_RAM_T);
             if (Util.arrayCompare(ecdsaRam, ECDSA_RAM_T, antiexfil_state, ANTIEXFIL_OFFSET_C, (short)32) != (byte)0)
                 ISOException.throwIt(SW_ECDSA_ANTIEXFIL_COMMITMENT);
-            // k0 again, from the RECOMPUTED commitment (see the note above), with z of OP_INIT
+            schnorr_hash_tag(ANTIEXFIL_TAGS, (short)0, ANTIEXFIL_TAG_DATA_SIZE, ecdsaRam, ECDSA_RAM_RHO2, (short)32, ecdsaRam, ECDSA_RAM_T2);
+            if (Util.arrayCompare(ecdsaRam, ECDSA_RAM_T2, antiexfil_state, ANTIEXFIL_OFFSET_C, (short)32) != (byte)0)
+                ISOException.throwIt(SW_ECDSA_ANTIEXFIL_COMMITMENT);
+            // k0 again, from the RECOMPUTED commitment (see the note above), with z of OP_INIT.
+            // It is left in K and K2; only K2 is used below.
             antiexfilDeriveK0(privkey, ecdsaRam, ECDSA_RAM_T);
 
-            // t = tagged_hash("s2c/ecdsa/point", R0 compressed | rho), a public value
-            Util.arrayCopyNonAtomic(antiexfil_state, (short)(ANTIEXFIL_OFFSET_R0+1), buffer, (short)(ECDSA_APDU_Q+1), (short)32);
-            buffer[ECDSA_APDU_Q] = (byte)(0x02 | (antiexfil_state[(short)(ANTIEXFIL_OFFSET_R0+64)] & 0x01));
-            Util.arrayCopyNonAtomic(ecdsaRam, ECDSA_RAM_V, buffer, (short)(ECDSA_APDU_Q+33), (short)32);
-            schnorr_hash_tag(ANTIEXFIL_TAGS, ANTIEXFIL_TAG_DATA_SIZE, ANTIEXFIL_TAG_POINT_SIZE, buffer, ECDSA_APDU_Q, (short)65, ecdsaRam, ECDSA_RAM_T);
-            // t must be in [1, n-1] (it is, except with negligible probability)
-            if (Biginteger.equalZero(ecdsaRam, ECDSA_RAM_T, (short)32)
-                    || !Biginteger.lessThan(ecdsaRam, ECDSA_RAM_T, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32))
-                ISOException.throwIt(SW_ECDSA_NONCE_ERROR);
+            // t = tagged_hash("s2c/ecdsa/point", R0 compressed | rho), a public value, twice:
+            // T from the first copy of rho, T2 from the second, each from its own hash input
+            antiexfilTweak(buffer, ECDSA_RAM_V, ECDSA_RAM_T);
+            antiexfilTweak(buffer, ECDSA_RAM_RHO2, ECDSA_RAM_T2);
 
-            // k = k0 + t mod n, in constant time (k0 is secret); k must not be 0
-            Biginteger.addModCT(recvBuffer, ECDSA_OFFSET_K, ecdsaRam, ECDSA_RAM_T,
+            // k = k0 + T mod n, in constant time (k0 is secret); k must not be 0
+            Biginteger.addModCT(ecdsaRam, ECDSA_RAM_K2, ecdsaRam, ECDSA_RAM_T,
                     Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32, recvBuffer, ECDSA_OFFSET_ACC);
-            if (Biginteger.isZeroCT(recvBuffer, ECDSA_OFFSET_K, (short)32))
+            if (Biginteger.isZeroCT(ecdsaRam, ECDSA_RAM_K2, (short)32))
                 ISOException.throwIt(SW_ECDSA_NONCE_ERROR);
-            // s is computed from the second copy of k (see "Redundancy" in the scratch map)
-            Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_K, ecdsaRam, ECDSA_RAM_K2, (short)32);
 
-            // R = R0 + t*G, on public values: the point addition engine with the scalar t
-            setEphemeralScalar(ecdsaRam, ECDSA_RAM_T);
+            // R = R0 + T2*G, on public values: the point addition engine with the scalar T2
+            setEphemeralScalar(ecdsaRam, ECDSA_RAM_T2);
             keyAgreementAdd.init(ephemeral_privkey);
             keyAgreementAdd.generateSecret(antiexfil_state, ANTIEXFIL_OFFSET_R0, (short)65, buffer, ECDSA_APDU_R);
             // r = x(R) mod n
@@ -3018,7 +3061,7 @@ public class Satochip extends javacard.framework.Applet {
                 ISOException.throwIt(SW_ECDSA_NONCE_ERROR);
 
             // s = k^-1 (h + r*d), then the common end: low-S, verification, DER.
-            // r and k do not come from the same computation here: the verification is what ties them.
+            // k comes from T and r from T2: the verification only passes if both are the same t.
             ecdsaComputeS(buffer);
             if (Biginteger.isZeroCT(ecdsaRam, ECDSA_RAM_T, (short)32))
                 ISOException.throwIt(SW_ECDSA_NONCE_ERROR);
@@ -3034,7 +3077,24 @@ public class Satochip extends javacard.framework.Applet {
     }
 
     /**
+     * Anti-exfil: ecdsaRam[tOff] = t = tagged_hash("s2c/ecdsa/point", R0 compressed | rho), with
+     * rho at ecdsaRam[rhoOff] and R0 from the stored state. The hash input is assembled in
+     * buffer[ECDSA_APDU_Q..+65) on each call. t must be in [1, n-1] (it is, except with
+     * negligible probability). All these values are public.
+     */
+    private void antiexfilTweak(byte[] buffer, short rhoOff, short tOff) {
+        Util.arrayCopyNonAtomic(antiexfil_state, (short)(ANTIEXFIL_OFFSET_R0+1), buffer, (short)(ECDSA_APDU_Q+1), (short)32);
+        buffer[ECDSA_APDU_Q] = (byte)(0x02 | (antiexfil_state[(short)(ANTIEXFIL_OFFSET_R0+64)] & 0x01));
+        Util.arrayCopyNonAtomic(ecdsaRam, rhoOff, buffer, (short)(ECDSA_APDU_Q+33), (short)32);
+        schnorr_hash_tag(ANTIEXFIL_TAGS, ANTIEXFIL_TAG_DATA_SIZE, ANTIEXFIL_TAG_POINT_SIZE, buffer, ECDSA_APDU_Q, (short)65, ecdsaRam, tOff);
+        if (Biginteger.equalZero(ecdsaRam, tOff, (short)32)
+                || !Biginteger.lessThan(ecdsaRam, tOff, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32))
+            ISOException.throwIt(SW_ECDSA_NONCE_ERROR);
+    }
+
+    /**
      * Anti-exfil: loads h (from the stored z) and d, and derives k0 = RFC 6979(d, h, extra) into K,
+     * and K2 (two computations of the last step, see rfc6979Candidate()),
      * where extra is the 32-byte host commitment at commitment[commitmentOff].
      * As in BIP461 sign(), the next output of the generator is taken while the nonce is not in [1, n-1].
      */
@@ -3070,7 +3130,7 @@ public class Satochip extends javacard.framework.Applet {
      *   V = 0x01 * 32, K = 0x00 * 32
      *   K = HMAC(K, V | 0x00 | d | h | extra),  V = HMAC(K, V)
      *   K = HMAC(K, V | 0x01 | d | h | extra),  V = HMAC(K, V)
-     *   V = HMAC(K, V)                           the candidate
+     *   V = HMAC(K, V)                           the candidate, computed twice (rfc6979Candidate())
      * extra is empty for counter 0, else the counter on 4 bytes little endian followed by 28 zeros.
      */
     private void rfc6979Init(short grind) {
@@ -3098,7 +3158,19 @@ public class Satochip extends javacard.framework.Applet {
             HmacSha256.finish(recvBuffer, ECDSA_OFFSET_HK, recvBuffer, ECDSA_OFFSET_HK);
             rfc6979UpdateV();
         }
+        rfc6979Candidate();
+    }
+
+    /**
+     * Last step of a nonce derivation, V = HMAC(K, V), done twice on two copies of V: the
+     * candidate is left in K (recvBuffer) and in K2 (ecdsaRam). See "Redundancy" above.
+     */
+    private void rfc6979Candidate() {
+        Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_K, ecdsaRam, ECDSA_RAM_K2, (short)32);
         rfc6979UpdateV();
+        HmacSha256.begin(recvBuffer, ECDSA_OFFSET_HK);
+        HmacSha256.update(ecdsaRam, ECDSA_RAM_K2, (short)32);
+        HmacSha256.finish(recvBuffer, ECDSA_OFFSET_HK, ecdsaRam, ECDSA_RAM_K2);
     }
 
     /** V = HMAC(K, V) */
@@ -3115,7 +3187,7 @@ public class Satochip extends javacard.framework.Applet {
         HmacSha256.update(ECDSA_RFC6979_SEPARATORS, (short)0, (short)1);
         HmacSha256.finish(recvBuffer, ECDSA_OFFSET_HK, recvBuffer, ECDSA_OFFSET_HK);
         rfc6979UpdateV();
-        rfc6979UpdateV();
+        rfc6979Candidate();
     }
 
     /** Draws a uniformly random scalar in [1, n-1] (rejection sampling) at dst[dstOff]. */
@@ -3152,6 +3224,10 @@ public class Satochip extends javacard.framework.Applet {
     /**
      * R = k*G without handing k to the EC engine: Q = w*G for a fresh random w, then
      * R = (k * w^-1) * Q. Leaves the point R at buffer[ECDSA_APDU_R], uncompressed.
+     * k is read from K. SW_ECDSA_VERIFY_FAILED is thrown, before R is computed, if the scalar
+     * k' that goes to the EC engine is not k * w^-1 (k' * w is recomputed and compared with K2),
+     * and after it if K differs from K2: the caller must not look at R, output it or decide
+     * anything from it when k or one of its working copies was altered (rule 2 of "Redundancy").
      */
     private void ecdsaComputeR(byte[] buffer) {
         // Q = w*G
@@ -3164,10 +3240,21 @@ public class Satochip extends javacard.framework.Applet {
         // k' = k * w^-1 mod n, with k blinded. k' is not 0: neither factor is.
         mulModOrder(ecdsaRam, (short)(ECDSA_RAM_INV+32), recvBuffer, ECDSA_OFFSET_K);
         Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_PRODUCT, ecdsaRam, ECDSA_RAM_T, (short)32);
+        // Check k' * w = k against the second computation of k. K, its blinded copy, the
+        // product and w^-1 each exist once on the way to k'; if one bit of any of them is
+        // flipped, R is off by a multiple of G the attacker can recognize (a power of two for
+        // K and its blinded copy), and what he then sees (the point, or whether the card
+        // refuses or grinds) gives bits of k.
+        mulModOrder(recvBuffer, ECDSA_OFFSET_X, ecdsaRam, ECDSA_RAM_T);
+        if (!arrayCompareConstantTime(recvBuffer, ECDSA_OFFSET_PRODUCT, ecdsaRam, ECDSA_RAM_K2, (short)32))
+            ISOException.throwIt(SW_ECDSA_VERIFY_FAILED);
         // R = k' * Q
         setEphemeralScalar(ecdsaRam, ECDSA_RAM_T);
         keyAgreement.init(ephemeral_privkey);
         keyAgreement.generateSecret(buffer, ECDSA_APDU_Q, (short)65, buffer, ECDSA_APDU_R);
+        // K must still be what K2 is, before anything is done with R
+        if (!arrayCompareConstantTime(recvBuffer, ECDSA_OFFSET_K, ecdsaRam, ECDSA_RAM_K2, (short)32))
+            ISOException.throwIt(SW_ECDSA_VERIFY_FAILED);
     }
 
     /**
