@@ -2685,10 +2685,13 @@ public class Satochip extends javacard.framework.Applet {
      *     two copies of its input and gives K and K2 (rfc6979Candidate()). R is computed from
      *     K, s from K2. A fault before that step gives an unrelated nonce in both; a fault in
      *     either result is caught by the next point.
-     *   - K and K2 are compared right after R has been computed, before r is looked at
-     *     (ecdsaComputeR()). Without this, a flipped bit of K would make the card either
-     *     refuse (r still low) or move to the next grind counter (r turned high), and which of
-     *     the two happens tells the attacker that bit of k.
+     *   - before R is used, ecdsaComputeR() checks the scalar it hands to the EC engine
+     *     against K2 (k' * w = k) and compares K with K2. Without this, a flipped bit of K or
+     *     of its blinded copy would make the card either refuse (r still low) or move to the
+     *     next grind counter (r turned high), and which of the two happens tells the attacker
+     *     that bit. For the blinded copy k + m*n this matters for the top 8 bits only: with
+     *     m < 2^119 they are those of k up to a borrow (n = 2^256 - c with c < 2^129), which
+     *     is also why the additive blinding does not hide these 8 bits from the RSA engine.
      *   - s is stored twice: the verification reads S2, the output is encoded from T, and the
      *     two are compared after the verification. If either copy is altered while the signature
      *     is being checked, nothing is output.
@@ -2932,9 +2935,10 @@ public class Satochip extends javacard.framework.Applet {
      * R = k*G without handing k to the EC engine: Q = w*G for a fresh random w, then
      * R = (k * w^-1) * Q. Leaves R at buffer[ECDSA_APDU_R] and reduces its x coordinate to
      * r = x(R) mod n in place.
-     * k is read from K. Once R is computed, K is compared with K2 and SW_ECDSA_VERIFY_FAILED is
-     * thrown if they differ: the caller must not look at R, output it or decide anything from
-     * it when K was altered (rule 2 of "Redundancy" above).
+     * k is read from K. SW_ECDSA_VERIFY_FAILED is thrown, before R is computed, if the scalar
+     * k' that goes to the EC engine is not k * w^-1 (k' * w is recomputed and compared with K2),
+     * and after it if K differs from K2: the caller must not look at R, output it or decide
+     * anything from it when k or one of its working copies was altered (rule 2 of "Redundancy").
      */
     private void ecdsaComputeR(byte[] buffer) {
         // Q = w*G
@@ -2947,6 +2951,14 @@ public class Satochip extends javacard.framework.Applet {
         // k' = k * w^-1 mod n, with k blinded. k' is not 0: neither factor is.
         mulModOrder(ecdsaRam, (short)(ECDSA_RAM_INV+32), recvBuffer, ECDSA_OFFSET_K);
         Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_PRODUCT, ecdsaRam, ECDSA_RAM_T, (short)32);
+        // Check k' * w = k against the second computation of k. K, its blinded copy, the
+        // product and w^-1 each exist once on the way to k'; if one bit of any of them is
+        // flipped, R is off by a multiple of G the attacker can recognize (a power of two for
+        // K and its blinded copy), and what he then sees (the point, or whether the card
+        // refuses or grinds) gives bits of k.
+        mulModOrder(recvBuffer, ECDSA_OFFSET_X, ecdsaRam, ECDSA_RAM_T);
+        if (!arrayCompareConstantTime(recvBuffer, ECDSA_OFFSET_PRODUCT, ecdsaRam, ECDSA_RAM_K2, (short)32))
+            ISOException.throwIt(SW_ECDSA_VERIFY_FAILED);
         // R = k' * Q
         setEphemeralScalar(ecdsaRam, ECDSA_RAM_T);
         keyAgreement.init(ephemeral_privkey);
