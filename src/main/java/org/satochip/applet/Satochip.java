@@ -307,9 +307,9 @@ public class Satochip extends javacard.framework.Applet {
     /** Taproot very low probability error*/
     private final static short SW_TAPROOT_TWEAK_ERROR = (short) 0x9C43;
     private final static short SW_SCHNORR_INVALID_NONCE = (short) 0x9C4C;
-    /** Self-built ECDSA: the signature just computed does not verify (computation error or fault injection): nothing is returned */
+    /** Self-built ECDSA: the signature just computed does not verify, or two copies of a value that must be equal differ (computation error or fault injection): nothing is returned */
     private final static short SW_ECDSA_VERIFY_FAILED = (short) 0x9C4D;
-    /** Self-built ECDSA: no acceptable nonce was found within the attempt limits (not expected to happen) */
+    /** Self-built ECDSA: no acceptable nonce within 64 grind counters, or 4 unacceptable candidates or random draws in a row (not expected to happen) */
     private final static short SW_ECDSA_NONCE_ERROR = (short) 0x9C4E;
 
     /** MuSig2 errors **/
@@ -1444,13 +1444,15 @@ public class Satochip extends javacard.framework.Applet {
      * Called from a finally block, so that error exits are covered too.
      */
     private void clearSigningScratch(byte[] buffer, short from, short to){
-        clearEphemeralKey();
         Util.arrayFillNonAtomic(buffer, from, (short)(to-from), (byte)0);
         Util.arrayFillNonAtomic(recvBuffer, (short)0, (short)recvBuffer.length, (byte)0);
         Util.arrayFillNonAtomic(tmpBuffer, (short)0, (short)tmpBuffer.length, (byte)0);
         Util.arrayFillNonAtomic(ecdsaRam, (short)0, ECDSA_RAM_SIZE, (byte)0);
         Util.arrayFillNonAtomic(Biginteger.buffer1, (short)0, (short)Biginteger.buffer1.length, (byte)0);
         Util.arrayFillNonAtomic(Biginteger.buffer2, (short)0, (short)Biginteger.buffer2.length, (byte)0);
+        // last: on a card where the scratch key is persistent this is a write to EEPROM, and
+        // if it throws, the buffers above are already erased
+        clearEphemeralKey();
     }
 
     /**
@@ -1458,7 +1460,8 @@ public class Satochip extends javacard.framework.Applet {
      * key...). On a card without transient EC keys (e.g. JCOP3 P60) the scratch key is a
      * persistent object: clearKey() would also erase its curve parameters, which are only set
      * again before use for transient keys, so its value is overwritten with the scalar 1
-     * instead. Otherwise the last scalar would stay in EEPROM, also across a power cut.
+     * instead. Until that write the scalar is in EEPROM, also across a power cut, and whether
+     * the overwrite physically erases the old value depends on the card.
      */
     private void clearEphemeralKey(){
         if (ephemeral_privkey_transient)
@@ -2662,24 +2665,40 @@ public class Satochip extends javacard.framework.Applet {
      * During the verification (public values only) recvBuffer is reused: X holds u2,
      * [0..65) the point u2*P and [96..161) the point R' = u1*G + u2*P.
      *
-     * Redundancy against a fault in RAM. The nonce is deterministic, so a signature made with a
-     * corrupted h or k next to the correct signature for the same key and hash can give the
-     * private key away, and the verification alone does not see such a corruption when one
-     * stored value feeds both the signature and its check. Therefore:
+     * Redundancy against a fault in RAM. The fault that is considered: during one command, one
+     * bit of one stored value is flipped, at a place and time the attacker chooses, and the
+     * command can be repeated at will. Skipped instructions, several faults in one command and
+     * faults that only affect one read are NOT considered, and nothing here was tested on a card.
+     * The nonce is deterministic, so a signature made with a corrupted h or k next to the
+     * correct signature for the same key and hash can give the private key away, and the
+     * verification alone does not see such a corruption when one stored value feeds both the
+     * signature and its check. Two rules follow:
+     *   1. a value that depends on a secret reaches the signature and its check through two
+     *      separate copies or two separate computations;
+     *   2. nothing the outside can observe (a signature, a point, a refusal, the move to the
+     *      next grind counter) is decided from a secret value before that value has been
+     *      checked against its second copy.
+     * How they are applied:
      *   - h is stored twice, from two separate reads of the command data: s is computed from H,
      *     the verification uses H2. If either copy is altered, the signature does not verify.
-     *   - k is stored twice: R is computed from K, s from K2. If either copy is altered, r and s
-     *     no longer belong to the same nonce and the signature does not verify.
+     *   - k is computed twice: the last step of the nonce derivation, V = HMAC(K, V), is run on
+     *     two copies of its input and gives K and K2 (rfc6979Candidate()). R is computed from
+     *     K, s from K2. A fault before that step gives an unrelated nonce in both; a fault in
+     *     either result is caught by the next point.
+     *   - K and K2 are compared right after R has been computed, before r is looked at
+     *     (ecdsaComputeR()). Without this, a flipped bit of K would make the card either
+     *     refuse (r still low) or move to the next grind counter (r turned high), and which of
+     *     the two happens tells the attacker that bit of k.
      *   - s is stored twice: the verification reads S2, the output is encoded from T, and the
      *     two are compared after the verification. If either copy is altered while the signature
      *     is being checked, nothing is output.
      *   - the verification result is checked twice, and the r that is output is the x coordinate
      *     of the point R' the verification recomputed, not the r that went into it.
-     * Not covered: a fault that alters k between the end of its derivation and the copy to K2
-     * (a few instructions later) changes both copies alike; covering it would take a second
-     * derivation of the nonce, i.e. twice the HMAC work.
-     * A fault that makes a discarded nonce out of a good one (r turned high) only moves the card
-     * to the next grind counter: the result is a valid signature under an unrelated nonce.
+     * Known gaps under that same fault model:
+     *   - after the last comparison, r, s and the DER encoding exist once: a flipped bit there
+     *     is output as an invalid signature (which the attacker could produce himself);
+     *   - the HMAC key of the last derivation step is one stored value read by both
+     *     computations of k: if it is altered before both, k is an unrelated value in both.
      */
     private static final short ECDSA_OFFSET_ACC = (short)0;
     private static final short ECDSA_OFFSET_PRODUCT = (short)64; // last 32 bytes of ACC
@@ -2758,8 +2777,8 @@ public class Satochip extends javacard.framework.Applet {
                     // k is secret: constant-time checks, and no short-circuit between them
                     if (!Biginteger.isZeroCT(recvBuffer, ECDSA_OFFSET_K, (short)32)
                             & Biginteger.lessThanCT(recvBuffer, ECDSA_OFFSET_K, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32)) {
-                        // second copy of k, taken at once: R is computed from K, s from K2
-                        Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_K, ecdsaRam, ECDSA_RAM_K2, (short)32);
+                        // R is computed from K and s from K2; ecdsaComputeR() refuses to go on
+                        // if the two differ
                         ecdsaComputeR(buffer);
                         // r is public from here on
                         if (!Biginteger.equalZero(buffer, (short)(ECDSA_APDU_R+1), (short)32)) {
@@ -2826,7 +2845,7 @@ public class Satochip extends javacard.framework.Applet {
      *   V = 0x01 * 32, K = 0x00 * 32
      *   K = HMAC(K, V | 0x00 | d | h | extra),  V = HMAC(K, V)
      *   K = HMAC(K, V | 0x01 | d | h | extra),  V = HMAC(K, V)
-     *   V = HMAC(K, V)                           the candidate
+     *   V = HMAC(K, V)                           the candidate, computed twice (rfc6979Candidate())
      * extra is empty for counter 0, else the counter on 4 bytes little endian followed by 28 zeros.
      */
     private void rfc6979Init(short grind) {
@@ -2846,7 +2865,19 @@ public class Satochip extends javacard.framework.Applet {
             HmacSha256.finish(recvBuffer, ECDSA_OFFSET_HK, recvBuffer, ECDSA_OFFSET_HK);
             rfc6979UpdateV();
         }
+        rfc6979Candidate();
+    }
+
+    /**
+     * Last step of a nonce derivation, V = HMAC(K, V), done twice on two copies of V: the
+     * candidate is left in K (recvBuffer) and in K2 (ecdsaRam). See "Redundancy" above.
+     */
+    private void rfc6979Candidate() {
+        Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_K, ecdsaRam, ECDSA_RAM_K2, (short)32);
         rfc6979UpdateV();
+        HmacSha256.begin(recvBuffer, ECDSA_OFFSET_HK);
+        HmacSha256.update(ecdsaRam, ECDSA_RAM_K2, (short)32);
+        HmacSha256.finish(recvBuffer, ECDSA_OFFSET_HK, ecdsaRam, ECDSA_RAM_K2);
     }
 
     /** V = HMAC(K, V) */
@@ -2863,7 +2894,7 @@ public class Satochip extends javacard.framework.Applet {
         HmacSha256.update(ECDSA_RFC6979_SEPARATORS, (short)0, (short)1);
         HmacSha256.finish(recvBuffer, ECDSA_OFFSET_HK, recvBuffer, ECDSA_OFFSET_HK);
         rfc6979UpdateV();
-        rfc6979UpdateV();
+        rfc6979Candidate();
     }
 
     /** Draws a uniformly random scalar in [1, n-1] (rejection sampling) at dst[dstOff]. */
@@ -2901,6 +2932,9 @@ public class Satochip extends javacard.framework.Applet {
      * R = k*G without handing k to the EC engine: Q = w*G for a fresh random w, then
      * R = (k * w^-1) * Q. Leaves R at buffer[ECDSA_APDU_R] and reduces its x coordinate to
      * r = x(R) mod n in place.
+     * k is read from K. Once R is computed, K is compared with K2 and SW_ECDSA_VERIFY_FAILED is
+     * thrown if they differ: the caller must not look at R, output it or decide anything from
+     * it when K was altered (rule 2 of "Redundancy" above).
      */
     private void ecdsaComputeR(byte[] buffer) {
         // Q = w*G
@@ -2917,6 +2951,9 @@ public class Satochip extends javacard.framework.Applet {
         setEphemeralScalar(ecdsaRam, ECDSA_RAM_T);
         keyAgreement.init(ephemeral_privkey);
         keyAgreement.generateSecret(buffer, ECDSA_APDU_Q, (short)65, buffer, ECDSA_APDU_R);
+        // K must still be what K2 is, before anything is done with R
+        if (!arrayCompareConstantTime(recvBuffer, ECDSA_OFFSET_K, ecdsaRam, ECDSA_RAM_K2, (short)32))
+            ISOException.throwIt(SW_ECDSA_VERIFY_FAILED);
         // r = x(R) mod n
         reduceModOrder(buffer, (short)(ECDSA_APDU_R+1));
     }
