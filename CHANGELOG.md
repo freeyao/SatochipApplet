@@ -16,7 +16,7 @@ SignTransactionHash no longer uses the card's black-box ECDSA, and the three sig
 
 * **getBIP32ExtendedKey (0x6D), getPublicKeyFromPrivate (0x35), InitiateSecureChannel (0x81):** the card returns the full uncompressed public key instead of an x coordinate and a self-signature. Clients must parse the new formats; see *Removed* for the byte layouts and what to change.
 * **Installation** is refused with `SW_UNSUPPORTED_FEATURE` (0x9C05) on a card without the RSA squaring, the RSA exponentiation used for modular inversion, or `ALG_EC_PACE_GM`. Such a card could not sign.
-* **Installation** also fails on a card that cannot provide the working buffers in RAM (about 1 KB of transient memory, cleared on deselect or else on reset). They used to fall back to persistent memory, which would write private keys and nonces to EEPROM.
+* **Installation** also fails on a card that cannot provide the working buffers in RAM (about 1 KB of transient memory, cleared on deselect or else on reset). They used to fall back to persistent memory, which would write private keys and nonces to EEPROM. The same holds for the buffer of the secure channel (its MAC key and IV).
 * **Clients must check that the public key returned by getPublicKeyFromPrivate (0x35) is a point of the curve** (y^2 = x^3 + 7) before using it. That response no longer carries a self-signature, and the secure channel encrypts responses without authenticating them: a ciphertext altered in transit decrypts to bytes that are a point of the curve only with negligible probability. The on-curve check replaces what the public key recovery was doing implicitly. (The other two responses are covered by the authentikey signature.)
 
 ### New features
@@ -33,7 +33,7 @@ SignTransactionHash no longer uses the card's black-box ECDSA, and the three sig
 
 ### Security
 
-* The scratch EC key is overwritten with the scalar 1 after use on cards where it is a persistent object (no transient EC private keys, e.g. JCOP3 P60): the signing and key-derivation paths no longer leave the last nonce share or key in it. The value is still in EEPROM until that overwrite (a power cut in between leaves it there), whether the overwrite physically erases it depends on the card, and each signature writes this key about 7 times on such a card.
+* The scratch EC key is overwritten with the scalar 1 after use on cards where it is a persistent object (no transient EC private keys, e.g. JCOP3 P60): the signing and key-derivation paths and InitiateSecureChannel no longer leave the last nonce share or key in it. The value is still in EEPROM until that overwrite (a power cut in between leaves it there), whether the overwrite physically erases it depends on the card, and each signature writes this key about 7 times on such a card.
 * The intermediate secrets of the signature (masked inverse, h + r\*d, s before the check) are kept in an array of the applet instead of the APDU buffer.
 * The inversion engine is checked at install with a second known answer on a full-size input, and a result returned without its leading zero bytes is right-aligned.
 * `randomScalar()` stops with `0x9C4E` after 4 rejected draws instead of looping on a stuck random generator; the bytecode SHA-256 no longer issues a zero-length fill at the end of its block buffer.

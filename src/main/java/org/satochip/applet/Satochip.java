@@ -2721,7 +2721,7 @@ public class Satochip extends javacard.framework.Applet {
     /** Scratch of the self-built ECDSA that is neither recvBuffer nor the APDU buffer: RAM only, no persistent fallback. */
     private byte[] ecdsaRam;
     /** The scalar 1: what a persistent scratch key is overwritten with after use (see clearEphemeralKey()). */
-    private static final byte[] SCALAR_ONE = {
+    static final byte[] SCALAR_ONE = {
         0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,(byte)1};
     /**
      * Low-r grinding stops after this many nonces. Each one has probability 1/2 of giving a

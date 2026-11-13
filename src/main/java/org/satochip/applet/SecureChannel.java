@@ -113,11 +113,9 @@ class SecureChannel {
         this.recvBuffer = recvBuffer;
         this.tmpBuffer = tmpBuffer;
 
-        try {
-            sc_buffer = JCSystem.makeTransientByteArray((short) SIZE_SC_BUFFER, JCSystem.CLEAR_ON_DESELECT);
-        } catch (SystemException e) {
-            sc_buffer = new byte[SIZE_SC_BUFFER];
-        }
+        // RAM only (it holds the MAC key and the IV of the channel): cleared on deselect, else
+        // on reset, else the installation fails. No fallback to persistent memory.
+        sc_buffer = Satochip.makeTransientArray((short) SIZE_SC_BUFFER);
         sc_sessionkey = Satochip.buildTransientAES128Key();
     }
 
@@ -186,10 +184,12 @@ class SecureChannel {
             short pubkey_size = keyAgreement.generateSecret(Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_G, (short) 65, buffer, (short)2);
             Util.setShort(buffer, (short)0, pubkey_size);
             // the ephemeral private key is not needed anymore (forward secrecy within the card
-            // session). A persistent fallback key keeps its value: clearKey() would also erase the
-            // curve parameters, which are only set again for transient keys.
+            // session). A persistent fallback key is overwritten with the scalar 1: clearKey()
+            // would also erase its curve parameters, which are only set again for transient keys.
             if (ephemeral_privkey_transient) {
                 ephemeral_privkey.clearKey();
+            } else {
+                ephemeral_privkey.setS(Satochip.SCALAR_ONE, (short)0, (short)32);
             }
 
             // signed by the authentikey
