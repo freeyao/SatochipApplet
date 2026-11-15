@@ -3323,7 +3323,21 @@ public class Satochip extends javacard.framework.Applet {
      * data must lie in buffer[0..130) and are read before anything is written there.
      *
      * R = rand*G is computed as (rand * w^-1) * (w*G), so that the EC engine does not receive
-     * the nonce (see ecdsaComputeRPoint()); s is computed twice and compared.
+     * the nonce (see ecdsaComputeRPoint()). The signature is verified on the card before it is
+     * returned (see schnorrVerify()): SW_ECDSA_VERIFY_FAILED (0x9C4D) and no output if not.
+     *
+     * Redundancy, for the fault model of the self-built ECDSA (one bit of one stored value
+     * flipped during a command):
+     *   - m is held twice (H, H2). H feeds the first nonce computation and e, H2 the second
+     *     nonce computation and the e of the verification;
+     *   - the nonce is computed twice (K, K2) and compared before anything depends on it; R is
+     *     computed from K and s from K2, and the computation of R compares them again;
+     *   - e is computed twice: once for s, once more inside the verification, from the second
+     *     copy of m and from a public key that the key object computes again;
+     *   - s is held twice (T, S2): the verification reads S2, the output is T, compared after.
+     * t, d and x(P) exist once: a flip in t or x(P) before both nonce computations gives the
+     * valid signature of an unrelated nonce (a hash of other data); a flip in d, or in x(P)
+     * after them, gives a signature that does not verify.
      * @return 64
      */
     private short signSchnorr(byte[] buffer, short hashOffset, short auxOffset) {
@@ -3335,7 +3349,7 @@ public class Satochip extends javacard.framework.Applet {
         short sizeout = (short)0;
         try {
             // m, twice, each read on its own: H for the signature, H2 for the second computation
-            // of the nonce
+            // of the nonce and for the verification
             Util.arrayCopyNonAtomic(buffer, hashOffset, recvBuffer, ECDSA_OFFSET_H, (short)32);
             Util.arrayCopyNonAtomic(buffer, hashOffset, ecdsaRam, ECDSA_RAM_H2, (short)32);
             // auxiliary random data: from the host, or zero. Not from the platform RNG.
@@ -3387,24 +3401,34 @@ public class Satochip extends javacard.framework.Applet {
             schnorrHash(false, (short)24, (short)17, buffer, (short)(ECDSA_APDU_R+1), buffer, (short)(SCHNORR_APDU_P+1),
                     recvBuffer, ECDSA_OFFSET_H, recvBuffer, ECDSA_OFFSET_HK);
 
-            // s = (k + e*d) mod n, with k and d blinded (see blindScalar()). Computed twice with
-            // independent blinding and compared: a fault in either computation, which would allow
-            // to recover d from s, R and P, is detected.
-            for (short round = (short)0; round < (short)2; round++){
-                // k = +-rand from the second computation of the nonce, as R was computed from the first
-                copyScalar(r_has_odd_y, ecdsaRam, ECDSA_RAM_K2, ecdsaRam, ECDSA_RAM_V);
-                Util.arrayFillNonAtomic(recvBuffer, ECDSA_OFFSET_ACC, BIGNUM_SIZE, (byte)0);
-                blindedAdd(recvBuffer, ECDSA_OFFSET_ACC, ecdsaRam, ECDSA_RAM_V);
-                blindedMulAdd(recvBuffer, ECDSA_OFFSET_ACC, recvBuffer, ECDSA_OFFSET_HK, recvBuffer, ECDSA_OFFSET_D);
-                Biginteger.mod(recvBuffer, ECDSA_OFFSET_ACC, BIGNUM_SIZE, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32);
-                if (round == (short)0)
-                    Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_PRODUCT, ecdsaRam, ECDSA_RAM_T, (short)32);
-            }
-            if (!arrayCompareConstantTime(recvBuffer, ECDSA_OFFSET_PRODUCT, ecdsaRam, ECDSA_RAM_T, (short)32))
-                ISOException.throwIt(SW_INTERNAL_ERROR);
+            // s = (k + e*d) mod n, with k and d blinded (see blindScalar())
+            // k = +-rand from the second computation of the nonce, as R was computed from the first
+            copyScalar(r_has_odd_y, ecdsaRam, ECDSA_RAM_K2, ecdsaRam, ECDSA_RAM_V);
+            Util.arrayFillNonAtomic(recvBuffer, ECDSA_OFFSET_ACC, BIGNUM_SIZE, (byte)0);
+            blindedAdd(recvBuffer, ECDSA_OFFSET_ACC, ecdsaRam, ECDSA_RAM_V);
+            blindedMulAdd(recvBuffer, ECDSA_OFFSET_ACC, recvBuffer, ECDSA_OFFSET_HK, recvBuffer, ECDSA_OFFSET_D);
+            Biginteger.mod(recvBuffer, ECDSA_OFFSET_ACC, BIGNUM_SIZE, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32);
+            Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_PRODUCT, ecdsaRam, ECDSA_RAM_T, (short)32);
+
+            // (R, s) is the signature: nothing secret is needed anymore
+            Util.arrayFillNonAtomic(recvBuffer, ECDSA_OFFSET_D, (short)32, (byte)0);
+            Util.arrayFillNonAtomic(recvBuffer, ECDSA_OFFSET_HK, (short)(ECDSA_SECRETS_END-ECDSA_OFFSET_HK), (byte)0);
+            Util.arrayFillNonAtomic(ecdsaRam, ECDSA_RAM_V, (short)32, (byte)0);
+            Util.arrayFillNonAtomic(ecdsaRam, ECDSA_RAM_K2, (short)32, (byte)0);
+
+            // check the signature before any byte of it leaves the card. The verification reads
+            // the second copies of s and m, and computes P and e again.
+            Util.arrayCopyNonAtomic(ecdsaRam, ECDSA_RAM_T, ecdsaRam, ECDSA_RAM_S2, (short)32);
+            schnorrVerify(buffer);
+            if (!arrayCompareConstantTime(ecdsaRam, ECDSA_RAM_T, ecdsaRam, ECDSA_RAM_S2, (short)32))
+                ISOException.throwIt(SW_ECDSA_VERIFY_FAILED);
+            // the verdict does not rest on that one branch: compare again here, and output the
+            // x(R') that the verification recomputed instead of the x(R) that went into it
+            if (!arrayCompareConstantTime(recvBuffer, (short)(ECDSA_OFFSET_D+1), buffer, (short)(ECDSA_APDU_R+1), (short)32))
+                ISOException.throwIt(SW_ECDSA_VERIFY_FAILED);
 
             // bytes(R) || bytes(s), built aside in recvBuffer[0..64)
-            Util.arrayCopyNonAtomic(buffer, (short)(ECDSA_APDU_R+1), recvBuffer, ECDSA_OFFSET_ACC, (short)32);
+            Util.arrayCopyNonAtomic(recvBuffer, (short)(ECDSA_OFFSET_D+1), recvBuffer, ECDSA_OFFSET_ACC, (short)32);
             Util.arrayCopyNonAtomic(ecdsaRam, ECDSA_RAM_T, recvBuffer, (short)(ECDSA_OFFSET_ACC+32), (short)32);
             sizeout = (short)64;
             Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_ACC, buffer, (short)0, sizeout);
@@ -3439,6 +3463,61 @@ public class Satochip extends javacard.framework.Applet {
             sha256.update(b, bOff, (short)32);
             sha256.doFinal(c, cOff, (short)32, dst, dstOff);
         }
+    }
+
+    /**
+     * Verifies the signature that signSchnorr() just computed, bytes(R) at buffer[ECDSA_APDU_R+1]
+     * and s at ecdsaRam[ECDSA_RAM_S2], for the message at ecdsaRam[ECDSA_RAM_H2] (the second copy,
+     * not the one the signature was computed from) and the taproot tweaked key, with the
+     * BIP340 verification:
+     *   e = int(hashBIP0340/challenge(bytes(R) || bytes(P) || m)) mod n,  R' = s*G - e*P,
+     *   accept if R' is not infinity, has an even y, and x(R') = x(R)
+     * Nothing is taken over from the signing: P is computed again by the key object, and e is
+     * hashed again. A signature made with an altered e would otherwise verify against that
+     * same e, and next to a correct signature for the same nonce it gives the private key away.
+     * A signature that does not verify is the sign of a computation error or of an injected
+     * fault: SW_ECDSA_VERIFY_FAILED is thrown, and signSchnorr() erases everything without
+     * outputting a single byte of the signature.
+     *
+     * Only public values are handled (R, s, m, P, e): no blinding, and no modular
+     * multiplication or inversion at all. -e*P is a key agreement on the base point P, and the
+     * sum with s*G is the ALG_EC_PACE_GM key agreement. BIP340 takes for P the point with an
+     * even y: when the key object's P has an odd y that point is -P, and -e*(-P) = e*P.
+     * R and s are left untouched. On success the recomputed R' is left at
+     * recvBuffer[ECDSA_OFFSET_D] (65 bytes), for the caller's own comparison and for the output.
+     */
+    private void schnorrVerify(byte[] buffer) {
+        boolean valid = false;
+        try {
+            // P, from the key object
+            getPublicKey(taproot_tweakedkey, recvBuffer, ECDSA_OFFSET_D);
+            boolean p_has_odd_y = ((recvBuffer[(short)(ECDSA_OFFSET_D+64)] & 0x01) != 0);
+            // e mod n
+            schnorrHash(false, (short)24, (short)17, buffer, (short)(ECDSA_APDU_R+1), recvBuffer, (short)(ECDSA_OFFSET_D+1),
+                    ecdsaRam, ECDSA_RAM_H2, recvBuffer, ECDSA_OFFSET_X);
+            reduceModOrder(recvBuffer, ECDSA_OFFSET_X);
+            // B = -e*lift_x(x(P)): the scalar is n-e on P, or e on P when P = -lift_x(x(P)).
+            // e = 0 leaves no scalar a key object takes: the signature is refused (probability 2^-256).
+            if (Biginteger.equalZero(recvBuffer, ECDSA_OFFSET_X, (short)32))
+                ISOException.throwIt(SW_ECDSA_VERIFY_FAILED);
+            copyScalar(!p_has_odd_y, recvBuffer, ECDSA_OFFSET_X, ecdsaRam, ECDSA_RAM_V);
+            setEphemeralScalar(ecdsaRam, ECDSA_RAM_V);
+            keyAgreement.init(ephemeral_privkey);
+            keyAgreement.generateSecret(recvBuffer, ECDSA_OFFSET_D, (short)65, recvBuffer, ECDSA_OFFSET_ACC);
+            // R' = s*G + B
+            setEphemeralScalar(ecdsaRam, ECDSA_RAM_S2);
+            keyAgreementAdd.init(ephemeral_privkey);
+            keyAgreementAdd.generateSecret(recvBuffer, ECDSA_OFFSET_ACC, (short)65, recvBuffer, ECDSA_OFFSET_D);
+            // has_even_y(R') and x(R') == x(R) ?
+            valid = (recvBuffer[ECDSA_OFFSET_D] == (byte)0x04)
+                    && ((recvBuffer[(short)(ECDSA_OFFSET_D+64)] & 0x01) == 0)
+                    && (Util.arrayCompare(recvBuffer, (short)(ECDSA_OFFSET_D+1), buffer, (short)(ECDSA_APDU_R+1), (short)32) == (byte)0);
+        } catch (CryptoException e) {
+            // e.g. s = 0, or s*G - e*P is the point at infinity: not a valid signature
+            valid = false;
+        }
+        if (!valid)
+            ISOException.throwIt(SW_ECDSA_VERIFY_FAILED);
     }
 
     // BIP0340 tagged hash: dst = SHA256(SHA256(tag) || SHA256(tag) || msg)

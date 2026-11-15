@@ -164,6 +164,88 @@ public class EcdsaExposedAppletTest {
     }
   }
 
+  // ---- the Schnorr signature check, called directly --------------------------------------------
+
+  @Test
+  @DisplayName("The card's Schnorr signature check accepts the right signature and refuses any altered one")
+  void schnorrVerifyRefusesAlteredSignaturesTest() throws Exception {
+    byte[] aid = SatochipTest.SATOCHIP_INSTANCE_AID;
+    Satochip applet = (Satochip) engine.getApplet(new AID(aid, (short) 0, (byte) aid.length));
+    assertNotNull(applet, "the exposed applet instance should be reachable");
+
+    boolean sawOddP = false, sawEvenP = false;
+    try {
+      for (int i = 0; i < 6; i++) {
+        String id = "key " + i;
+        byte[] seckey = SatochipTest.sha256(("schnorr verify key " + i).getBytes());
+        byte[] tweaked = SatochipTest.bip86TweakedKey(seckey);
+        assertEquals(SatochipTest.SW_OK, SatochipTest.importSlotKey(cmd, SLOT, seckey), id);
+        APDUResponse tweak = cmd.sendRawSecure(SatochipTest.INS_TAPROOT_TWEAK_PRIVKEY, SLOT, 0x00, new byte[]{0x00});
+        assertEquals(SatochipTest.SW_OK, tweak.getSw(), id);
+        // the verification must handle both: BIP340 always takes the even-y point for P
+        if ((tweak.getData()[2 + 64] & 1) != 0) sawOddP = true; else sawEvenP = true;
+
+        byte[] m = SatochipTest.sha256(("schnorr verify message " + i).getBytes());
+        byte[] sig = SatochipTest.signBip340(tweaked, m, new byte[32]);
+        byte[] r = Arrays.copyOfRange(sig, 0, 32);
+        byte[] s = Arrays.copyOfRange(sig, 32, 64);
+
+        assertEquals(SatochipTest.SW_OK, schnorrVerifyOnCard(applet, m, r, s), "valid signature, " + id);
+        assertEquals(SW_ECDSA_VERIFY_FAILED, schnorrVerifyOnCard(applet, m, r, flip(s, 31)), "s altered, " + id);
+        assertEquals(SW_ECDSA_VERIFY_FAILED, schnorrVerifyOnCard(applet, m, r, flip(s, 0)), "s altered, " + id);
+        assertEquals(SW_ECDSA_VERIFY_FAILED, schnorrVerifyOnCard(applet, m, flip(r, 31), s), "R altered, " + id);
+        assertEquals(SW_ECDSA_VERIFY_FAILED, schnorrVerifyOnCard(applet, m, flip(r, 5), s), "R altered, " + id);
+        assertEquals(SW_ECDSA_VERIFY_FAILED, schnorrVerifyOnCard(applet, flip(m, 31), r, s), "message altered, " + id);
+        // (R, n-s) is the signature with the nonce and the key negated: not valid in BIP340
+        byte[] negS = Bip461.fixed32(Bip461.N.subtract(new BigInteger(1, s)));
+        assertEquals(SW_ECDSA_VERIFY_FAILED, schnorrVerifyOnCard(applet, m, r, negS), "(R, n-s), " + id);
+        // a valid signature of the same message under another key
+        byte[] foreign = SatochipTest.signBip340(SatochipTest.sha256(("another key " + i).getBytes()), m, new byte[32]);
+        assertEquals(SW_ECDSA_VERIFY_FAILED, schnorrVerifyOnCard(applet, m,
+            Arrays.copyOfRange(foreign, 0, 32), Arrays.copyOfRange(foreign, 32, 64)), "other key, " + id);
+        assertEquals(SatochipTest.SW_OK,
+            cmd.sendRawSecure(SatochipTest.INS_RESET_KEY, SLOT, 0x00, new byte[0]).getSw());
+      }
+    } finally {
+      cmd.sendRawSecure(SatochipTest.INS_RESET_KEY, SLOT, 0x00, new byte[0]);
+    }
+    assertTrue(sawOddP && sawEvenP, "the keys should cover both parities of y(P)");
+    // the card still signs correctly after the direct calls
+    SatochipTest.checkBip340Reference(cmd, SLOT, 2);
+  }
+
+  /**
+   * Lays R, s and m out where signSchnorr() leaves them for schnorrVerify(), calls it, and
+   * returns 0x9000 or the status word it threw. The scratch buffers are erased afterwards.
+   */
+  private static int schnorrVerifyOnCard(Satochip applet, byte[] m, byte[] r, byte[] s) throws Exception {
+    Method verify = Satochip.class.getDeclaredMethod("schnorrVerify", byte[].class);
+    verify.setAccessible(true);
+    byte[] recvBuffer = (byte[]) field(applet, "recvBuffer");
+    byte[] tmpBuffer = (byte[]) field(applet, "tmpBuffer");
+    byte[] ecdsaRam = (byte[]) field(applet, "ecdsaRam");
+    byte[] apdu = new byte[constant("SCHNORR_APDU_SIZE")];
+    // the verification reads the second copies of m and s
+    System.arraycopy(m, 0, ecdsaRam, constant("ECDSA_RAM_H2"), 32);
+    System.arraycopy(r, 0, apdu, constant("ECDSA_APDU_R") + 1, 32);
+    System.arraycopy(s, 0, ecdsaRam, constant("ECDSA_RAM_S2"), 32);
+    try {
+      verify.invoke(applet, (Object) apdu);
+      assertArrayEquals(r, Arrays.copyOfRange(apdu, constant("ECDSA_APDU_R") + 1, constant("ECDSA_APDU_R") + 33));
+      assertArrayEquals(s, Arrays.copyOfRange(ecdsaRam, constant("ECDSA_RAM_S2"), constant("ECDSA_RAM_S2") + 32));
+      return SatochipTest.SW_OK;
+    } catch (InvocationTargetException e) {
+      if (e.getCause() instanceof ISOException) {
+        return ((ISOException) e.getCause()).getReason() & 0xFFFF;
+      }
+      throw e;
+    } finally {
+      Arrays.fill(recvBuffer, (byte) 0);
+      Arrays.fill(ecdsaRam, (byte) 0);
+      Arrays.fill(tmpBuffer, (byte) 0);
+    }
+  }
+
   private static Object field(Satochip applet, String name) throws Exception {
     Field f = Satochip.class.getDeclaredField(name);
     f.setAccessible(true);
