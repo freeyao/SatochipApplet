@@ -182,6 +182,9 @@ public class Satochip extends javacard.framework.Applet {
     private final static byte INS_SIGN_TRANSACTION_HASH= (byte) 0x7A;
     private final static byte INS_TAPROOT_TWEAK_PRIVKEY= (byte) 0x7C;
     private final static byte INS_SIGN_SCHNORR_HASH= (byte) 0x7B;
+    // P2 of SignSchnorrHash: where the BIP340 auxiliary random data comes from
+    private final static byte SCHNORR_AUX_ZERO= (byte) 0x00;
+    private final static byte SCHNORR_AUX_FROM_HOST= (byte) 0x01;
 
     private final static byte INS_MUSIG2_GENERATE_NONCE= (byte) 0x7E; // todo
     private final static byte INS_MUSIG2_SIGN_HASH= (byte) 0x7F;
@@ -3228,10 +3231,18 @@ public class Satochip extends javacard.framework.Applet {
      * Before using this method to sign a tx hash, a tweaked privkey must be derived 
      * from a (BIP32 or simple) privkey using TaprootTweakPrivateKey(), in the same session.
      * 
+     * The BIP340 auxiliary random data (a) is supplied by the host, never drawn from the
+     * platform RNG: a platform that picks a could grind it to encode data in R, which ends up
+     * on chain. With a host-supplied a the signature is a function of (key, hash, a) only, so it
+     * can be compared byte for byte with any other BIP340 signer. When the host supplies none
+     * (p2 = 0x00, the format of earlier clients), a is 32 zero bytes, which BIP340 allows.
+     *
      * ins: 0x7B
      * p1: 0x00  
-     * p2: 0x00
-     * data: [hash(32b) | option: 2FA-flag(2b)|hmac(20b)]
+     * p2: 0x00: a is 32 zero bytes
+     *     0x01: a follows the hash
+     *     Any other value is rejected with SW_INCORRECT_P2.
+     * data: [hash(32b) | if p2 is 0x01: aux(32b) | option: 2FA-flag(2b)|hmac(20b)]
      * 
      * return: [sig]
      * 
@@ -3255,24 +3266,31 @@ public class Satochip extends javacard.framework.Applet {
             ISOException.throwIt(SW_INCORRECT_INITIALIZATION);
         checkKeyCurve(taproot_tweakedkey);
 
+        // P2 tells whether the host supplies the auxiliary random data
+        byte p2 = buffer[ISO7816.OFFSET_P2];
+        if (p2 != SCHNORR_AUX_ZERO && p2 != SCHNORR_AUX_FROM_HOST)
+            ISOException.throwIt(SW_INCORRECT_P2);
+        // size of [hash | aux], the optional 2FA fields come after it
+        short prefixSize = (p2 == SCHNORR_AUX_FROM_HOST) ? (short)64 : (short)32;
+
         short bytesLeft = Util.makeShort((byte) 0x00, buffer[ISO7816.OFFSET_LC]);
-        if (bytesLeft<MessageDigest.LENGTH_SHA_256)
+        if (bytesLeft<prefixSize)
             ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
         
         // check 2FA if required
         if(needs_2FA){
             // check data length
-            if (bytesLeft<MessageDigest.LENGTH_SHA_256+MessageDigest.LENGTH_SHA+(short)2)
+            if (bytesLeft<(short)(prefixSize+MessageDigest.LENGTH_SHA+(short)2))
                 ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
             // check flag for 2fa_hmac_chalresp
-            short hmac_flags= Util.getShort(buffer, (short)(ISO7816.OFFSET_CDATA+32));
+            short hmac_flags= Util.getShort(buffer, (short)(ISO7816.OFFSET_CDATA+prefixSize));
             if (hmac_flags!=HMAC_CHALRESP_2FA)
                 ISOException.throwIt(SW_INCORRECT_ALG);
             // hmac of 64-bytes msg: ( 32bytes tx_hash | 32bytes 0xDD-padding)
             Util.arrayCopyNonAtomic(buffer, (short)ISO7816.OFFSET_CDATA, recvBuffer, (short)0, (short)32);
             Util.arrayFillNonAtomic(recvBuffer, (short)32, (short)32, (byte)0xDD); // 0xDD for Schnorr sig
             HmacSha160.computeHmacSha160(data2FA, OFFSET_2FA_HMACKEY, (short)20, recvBuffer, (short)0, (short)64, recvBuffer, (short)64);
-            if (!arrayCompareConstantTime(buffer, (short)(ISO7816.OFFSET_CDATA+32+2), recvBuffer, (short)64, (short)20))
+            if (!arrayCompareConstantTime(buffer, (short)(ISO7816.OFFSET_CDATA+prefixSize+2), recvBuffer, (short)64, (short)20))
                 ISOException.throwIt(SW_SIGNATURE_INVALID);
         }
 
@@ -3280,8 +3298,11 @@ public class Satochip extends javacard.framework.Applet {
         // finally block below, also on error. buffer[0..64) is kept on success (the signature).
         short sizeout = (short)0;
         try {
-            // generate randomness
-            randomData.generateData(recvBuffer, OFFSET_BIP340_aux, (short)32);
+            // auxiliary random data: from the host, or zero. Not from the platform RNG (see above).
+            if (p2 == SCHNORR_AUX_FROM_HOST)
+                Util.arrayCopyNonAtomic(buffer, (short)(ISO7816.OFFSET_CDATA+32), recvBuffer, OFFSET_BIP340_aux, (short)32);
+            else
+                Util.arrayFillNonAtomic(recvBuffer, OFFSET_BIP340_aux, (short)32, (byte)0);
         
             // copy message hash to buffer
             Util.arrayCopyNonAtomic(buffer, ISO7816.OFFSET_CDATA, recvBuffer, OFFSET_BIP340_m, (short)32);

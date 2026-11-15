@@ -1685,6 +1685,151 @@ public class SatochipTest {
     return verifier.verify(derSignature);
   }
 
+  // ---- BIP340 signing, byte for byte ------------------------------------------------------------
+
+  /** Keyslot used by the BIP340 tests; they leave it empty. */
+  static final int BIP340_SLOT = 13;
+  static final int P2_AUX_ZERO = 0x00;
+  static final int P2_AUX_FROM_HOST = 0x01;
+  static final int P2_TAPROOT_BYPASS_TWEAK = 0x01;
+
+  /**
+   * The signing vectors of BIP340 (test-vectors.csv, index 0 to 3) whose message is 32 bytes:
+   * {secret key, aux_rand, message, signature}.
+   */
+  static final String[][] BIP340_SIGNING_VECTORS = {
+      {"0000000000000000000000000000000000000000000000000000000000000003",
+       "0000000000000000000000000000000000000000000000000000000000000000",
+       "0000000000000000000000000000000000000000000000000000000000000000",
+       "E907831F80848D1069A5371B402410364BDF1C5F8307B0084C55F1CE2DCA821525F66A4A85EA8B71E482A74F382D2CE5EBEEE8FDB2172F477DF4900D310536C0"},
+      {"B7E151628AED2A6ABF7158809CF4F3C762E7160F38B4DA56A784D9045190CFEF",
+       "0000000000000000000000000000000000000000000000000000000000000001",
+       "243F6A8885A308D313198A2E03707344A4093822299F31D0082EFA98EC4E6C89",
+       "6896BD60EEAE296DB48A229FF71DFE071BDE413E6D43F917DC8DCF8C78DE33418906D11AC976ABCCB20B091292BFF4EA897EFCB639EA871CFA95F6DE339E4B0A"},
+      {"C90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B14E5C9",
+       "C87AA53824B4D7AE2EB035A2B5BBBCCC080E76CDC6D1692C4B0B62D798E6D906",
+       "7E2D58D8B3BCDF1ABADEC7829054F90DDA9805AAB56C77333024B9D0A508B75C",
+       "5831AAEED7B44BB74E5EAB94BA9D4294C49BCF2A60728D8B4C200F50DD313C1BAB745879A5AD954A72C45A91C3A51D3C7ADEA98D82F8481E0E1E03674A6F3FB7"},
+      {"0B432B2677937381AEF05BB02A66ECD012773062CF3FA2549E44F58ED2401710",
+       "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+       "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+       "7EB0509757E246F19449885651611CB965ECC1A187DD51B64FDA1EDC9637D5EC97582B9CB13DB3933705B32BA982AF5AF25FD78881EBB32771FC5922EFC66EA3"}
+  };
+
+  /** BIP340 default signing, written out from the specification: returns bytes(R) || bytes(s). */
+  static byte[] signBip340(byte[] seckey, byte[] msg, byte[] aux) {
+    ECNamedCurveParameterSpec spec = ECNamedCurveTable.getParameterSpec("secp256k1");
+    java.math.BigInteger n = Vectors.SECP256K1_N;
+    java.math.BigInteger d = new java.math.BigInteger(1, seckey);
+    ECPoint p = spec.getG().multiply(d).normalize();
+    if (p.getAffineYCoord().toBigInteger().testBit(0)) d = n.subtract(d);
+    byte[] px = to32(p.getAffineXCoord().toBigInteger());
+    byte[] t = to32(d);
+    byte[] auxHash = taggedHash("BIP0340/aux", aux);
+    for (int i = 0; i < 32; i++) t[i] ^= auxHash[i];
+    java.math.BigInteger k =
+        new java.math.BigInteger(1, taggedHash("BIP0340/nonce", concat(t, px, msg))).mod(n);
+    ECPoint r = spec.getG().multiply(k).normalize();
+    if (r.getAffineYCoord().toBigInteger().testBit(0)) k = n.subtract(k);
+    byte[] rx = to32(r.getAffineXCoord().toBigInteger());
+    java.math.BigInteger e =
+        new java.math.BigInteger(1, taggedHash("BIP0340/challenge", concat(rx, px, msg))).mod(n);
+    return concat(rx, to32(k.add(e.multiply(d)).mod(n)));
+  }
+
+  /** The key TaprootTweakPrivateKey() derives from seckey when there is no script tree (BIP86). */
+  static byte[] bip86TweakedKey(byte[] seckey) {
+    ECNamedCurveParameterSpec spec = ECNamedCurveTable.getParameterSpec("secp256k1");
+    java.math.BigInteger n = Vectors.SECP256K1_N;
+    java.math.BigInteger d = new java.math.BigInteger(1, seckey);
+    ECPoint p = spec.getG().multiply(d).normalize();
+    if (p.getAffineYCoord().toBigInteger().testBit(0)) d = n.subtract(d);
+    byte[] px = to32(p.getAffineXCoord().toBigInteger());
+    return to32(d.add(new java.math.BigInteger(1, taggedHash("TapTweak", px))).mod(n));
+  }
+
+  private static byte[] to32(java.math.BigInteger v) {
+    byte[] b = v.toByteArray();
+    byte[] out = new byte[32];
+    int len = Math.min(32, b.length);
+    System.arraycopy(b, b.length - len, out, 32 - len, len);
+    return out;
+  }
+
+  @Test
+  @DisplayName("BIP340: the official signing vectors are reproduced byte for byte")
+  @FeaturePolicies({"schnorr", "nostr", "rsaMult"})
+  void bip340OfficialVectorsTest() {
+    // The auxiliary random data comes from the host, so the card can be held to the official
+    // vectors. The key is staged as is (no taproot tweak), which the Nostr policy allows.
+    try {
+      for (String[] v : BIP340_SIGNING_VECTORS) {
+        byte[] aux = Hex.decode(v[1]);
+        byte[] msg = Hex.decode(v[2]);
+        assertEquals(SW_OK, importSlotKey(cmdSet, BIP340_SLOT, Hex.decode(v[0])));
+        assertEquals(SW_OK, cmdSet.sendRawSecure(INS_TAPROOT_TWEAK_PRIVKEY, BIP340_SLOT,
+            P2_TAPROOT_BYPASS_TWEAK, new byte[0]).getSw());
+        APDUResponse sig = cmdSet.sendRawSecure(INS_SIGN_SCHNORR_HASH, 0x00, P2_AUX_FROM_HOST,
+            concat(msg, aux));
+        assertEquals(SW_OK, sig.getSw());
+        assertArrayEquals(Hex.decode(v[3]), sig.getData(), "BIP340 vector, secret key " + v[0]);
+        assertEquals(SW_OK, cmdSet.sendRawSecure(INS_RESET_KEY, BIP340_SLOT, 0x00, new byte[0]).getSw());
+      }
+    } finally {
+      cmdSet.sendRawSecure(INS_RESET_KEY, BIP340_SLOT, 0x00, new byte[0]);
+    }
+  }
+
+  @Test
+  @DisplayName("BIP340: signatures match a reference signer, with and without host-supplied aux data")
+  @FeaturePolicies({"schnorr", "rsaMult"})
+  void bip340ReferenceTest() {
+    // Goes through the taproot tweak, so it needs no Nostr policy: the tweaked key is recomputed
+    // here from the imported key. Both parities of P and of R come up over the keys and messages.
+    try {
+      for (int i = 0; i < 6; i++) {
+        byte[] seckey = sha256(("bip340 reference key " + i).getBytes());
+        byte[] tweaked = bip86TweakedKey(seckey);
+        assertEquals(SW_OK, importSlotKey(cmdSet, BIP340_SLOT, seckey));
+        assertEquals(SW_OK, cmdSet.sendRawSecure(INS_TAPROOT_TWEAK_PRIVKEY, BIP340_SLOT, 0x00,
+            new byte[]{0x00}).getSw());
+        for (int j = 0; j < 3; j++) {
+          byte[] msg = sha256(("bip340 reference message " + i + " " + j).getBytes());
+          byte[] aux = sha256(("bip340 reference aux " + i + " " + j).getBytes());
+
+          APDUResponse sig = cmdSet.sendRawSecure(INS_SIGN_SCHNORR_HASH, 0x00, P2_AUX_FROM_HOST,
+              concat(msg, aux));
+          assertEquals(SW_OK, sig.getSw());
+          assertArrayEquals(signBip340(tweaked, msg, aux), sig.getData(),
+              "host-supplied aux, key " + i + " message " + j);
+
+          // without aux data (the format of earlier clients) the card uses 32 zero bytes
+          sig = cmdSet.sendRawSecure(INS_SIGN_SCHNORR_HASH, 0x00, P2_AUX_ZERO, msg);
+          assertEquals(SW_OK, sig.getSw());
+          assertArrayEquals(signBip340(tweaked, msg, new byte[32]), sig.getData(),
+              "no aux, key " + i + " message " + j);
+        }
+        assertEquals(SW_OK, cmdSet.sendRawSecure(INS_RESET_KEY, BIP340_SLOT, 0x00, new byte[0]).getSw());
+      }
+    } finally {
+      cmdSet.sendRawSecure(INS_RESET_KEY, BIP340_SLOT, 0x00, new byte[0]);
+    }
+  }
+
+  @Test
+  @DisplayName("SignSchnorrHash refuses an unknown P2 and a missing aux field")
+  @FeaturePolicies({"schnorr"})
+  void signSchnorrHashAuxFormatTest() {
+    cmdSet.cardBip32GetExtendedKeyRaw("m/86'/0'/0'/0/0");
+    assertEquals(SW_OK,
+        cmdSet.sendRawSecure(INS_TAPROOT_TWEAK_PRIVKEY, 0xFF, 0x00, new byte[]{0x00}).getSw());
+    assertEquals(SW_INCORRECT_P2,
+        cmdSet.sendRawSecure(INS_SIGN_SCHNORR_HASH, 0x00, 0x02, new byte[64]).getSw());
+    assertEquals(SW_WRONG_LENGTH,
+        cmdSet.sendRawSecure(INS_SIGN_SCHNORR_HASH, 0x00, P2_AUX_FROM_HOST, new byte[32]).getSw(),
+        "P2 announces aux data, so 32 bytes of hash alone are too short");
+  }
+
   /**
    * BIP340 verification, written out here rather than pulled from a library so that the applet is
    * checked against the specification itself.
