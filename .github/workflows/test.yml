@@ -62,10 +62,21 @@ jobs:
           path: build/reports/tests/test
           if-no-files-found: ignore
 
+      # The CAP is uploaded under a name that says which branch and commit it was built from:
+      # the artifacts of two branches used to be indistinguishable once downloaded.
+      - name: Name the CAP after the branch and commit
+        if: always()
+        shell: bash
+        run: |
+          name="satochip-${GITHUB_REF_NAME//\//-}-${GITHUB_SHA::7}"
+          echo "CAP_NAME=$name" >> "$GITHUB_ENV"
+          mkdir -p build/cap-artifact
+          cp build/javacard/org/satochip/applet/javacard/applet.cap "build/cap-artifact/$name.cap" || true
+
       - name: Upload the CAP
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: applet-cap
-          path: build/javacard/org/satochip/applet/javacard/applet.cap
+          name: ${{ env.CAP_NAME }}
+          path: build/cap-artifact/${{ env.CAP_NAME }}.cap
           if-no-files-found: ignore
