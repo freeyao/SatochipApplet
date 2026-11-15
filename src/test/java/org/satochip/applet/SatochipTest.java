@@ -287,7 +287,7 @@ public class SatochipTest {
     byte[] s = cmdSet.cardGetStatus().getData();
     assertEquals(20, s.length, "GET_STATUS payload length");
     assertEquals(0x00, s[0], "protocol major version");
-    assertEquals(0x13, s[1], "protocol minor version (0.19)");
+    assertEquals(0x14, s[1], "protocol minor version (0.20)");
     // the suite installs the applet without install data: platform SHA-256, RSA squaring engine
     assertEquals(0x00, s[18], "SHA-256 backend");
     assertEquals(0x00, s[19], "multiplication backend");
@@ -1151,7 +1151,6 @@ public class SatochipTest {
   static final int SW_SIGNATURE_INVALID = 0x9C0B;
   static final int SW_2FA_INITIALIZED_KEY = 0x9C18;
   static final int SW_ECKEYS_INITIALIZED_KEY = 0x9C1A;
-  static final int SW_BIP327_WRONG_SECNONCE = 0x9C44;
   static final int SW_BIP327_PUBKEY_MISMATCH = 0x9C45;
   static final int SW_BIP327_INVALID_ID = 0x9C47;
 
@@ -1217,24 +1216,24 @@ public class SatochipTest {
 
       // --- MuSig2: [b | ea | r | g | 0x8000 | hmac(sha256(b | ea | r | g) | 0xEE*32)]
       if (FeaturePolicyCondition.availableCapabilities.contains("musig2")) {
-        byte[] secnonce = musig2NewSecnonce("m/86'/0'/0'/0/0");
+        byte[] id = musig2NewSecnonce("m/86'/0'/0'/0/0");
         byte[] b = sha256("b".getBytes());
         byte[] ctx = concat(b, sha256("ea".getBytes()), new byte[]{0x00, 0x01});
         byte[] otherEa = concat(b, sha256("ea of another message".getBytes()), new byte[]{0x00, 0x01});
         byte[] otherFlags = concat(b, sha256("ea".getBytes()), new byte[]{0x00, 0x00});
-        assertEquals(SW_OK, cmdSet.sendRawSecure(INS_MUSIG2_SIGN_HASH, 0xFF, OP_INIT, secnonce).getSw());
         assertEquals(SW_SIGNATURE_INVALID, cmdSet.sendRawSecure(INS_MUSIG2_SIGN_HASH, 0xFF, OP_FINALIZE,
-            concat(ctx, HMAC_FLAG_2FA, hmac2FA(sha256(ctx), 0xCC))).getSw());
+            concat(id, ctx, HMAC_FLAG_2FA, hmac2FA(sha256(ctx), 0xCC))).getSw());
         // the former format (b alone) is refused, and the approval covers e*a and the flags
         assertEquals(SW_SIGNATURE_INVALID, cmdSet.sendRawSecure(INS_MUSIG2_SIGN_HASH, 0xFF, OP_FINALIZE,
-            concat(ctx, HMAC_FLAG_2FA, hmac2FA(b, 0xEE))).getSw());
+            concat(id, ctx, HMAC_FLAG_2FA, hmac2FA(b, 0xEE))).getSw());
         assertEquals(SW_SIGNATURE_INVALID, cmdSet.sendRawSecure(INS_MUSIG2_SIGN_HASH, 0xFF, OP_FINALIZE,
-            concat(otherEa, HMAC_FLAG_2FA, hmac2FA(sha256(ctx), 0xEE))).getSw());
+            concat(id, otherEa, HMAC_FLAG_2FA, hmac2FA(sha256(ctx), 0xEE))).getSw());
         assertEquals(SW_SIGNATURE_INVALID, cmdSet.sendRawSecure(INS_MUSIG2_SIGN_HASH, 0xFF, OP_FINALIZE,
-            concat(otherFlags, HMAC_FLAG_2FA, hmac2FA(sha256(ctx), 0xEE))).getSw());
-        // a failed 2FA attempt must not consume the secnonce id
+            concat(id, otherFlags, HMAC_FLAG_2FA, hmac2FA(sha256(ctx), 0xEE))).getSw());
+        // a failed 2FA attempt must not consume the secnonce (the approval covers b, e*a and
+        // the flags, not the id of the secnonce)
         sw = cmdSet.sendRawSecure(INS_MUSIG2_SIGN_HASH, 0xFF, OP_FINALIZE,
-            concat(ctx, HMAC_FLAG_2FA, hmac2FA(sha256(ctx), 0xEE))).getSw();
+            concat(id, ctx, HMAC_FLAG_2FA, hmac2FA(sha256(ctx), 0xEE))).getSw();
         assertNotEquals(SW_BIP327_INVALID_ID, sw);
         assertNotEquals(SW_SIGNATURE_INVALID, sw);
         if (FeaturePolicyCondition.availableCapabilities.contains("rsaMult")) {
@@ -1286,10 +1285,11 @@ public class SatochipTest {
   }
 
   @Test
-  @DisplayName("MuSig2 secnonces are authenticated, bound to their key and single-use")
+  @DisplayName("MuSig2 secnonces stay in the card, are bound to their key and single-use")
   @FeaturePolicies({"musig2"})
   void musig2NonceTest() {
-    // Pubnonce format: [R1(33b) | R2(33b) | id(2b)], both R compressed points on secp256k1
+    // Response: [R1(33b) | R2(33b) | id(2b)], both R compressed points on secp256k1. The secnonce
+    // itself is not exported anymore: the former second step (OP_FINALIZE) is refused.
     cmdSet.cardBip32GetExtendedKeyRaw("m/86'/0'/0'/0/1");
     APDUResponse init = cmdSet.sendRawSecure(INS_MUSIG2_GENERATE_NONCE, 0xFF, OP_INIT,
         new byte[]{0x00, (byte) 0xFF, 0x00});
@@ -1298,71 +1298,121 @@ public class SatochipTest {
     ECNamedCurveParameterSpec spec = ECNamedCurveTable.getParameterSpec("secp256k1");
     spec.getCurve().decodePoint(Arrays.copyOfRange(init.getData(), 0, 33));
     spec.getCurve().decodePoint(Arrays.copyOfRange(init.getData(), 33, 66));
-    APDUResponse fin = cmdSet.sendRawSecure(INS_MUSIG2_GENERATE_NONCE, 0xFF, OP_FINALIZE, new byte[0]);
-    assertEquals(SW_OK, fin.getSw());
-    assertEquals(144, fin.getData().length);
+    byte[] id = Arrays.copyOfRange(init.getData(), 66, 68);
+    assertEquals(SW_INCORRECT_P2,
+        cmdSet.sendRawSecure(INS_MUSIG2_GENERATE_NONCE, 0xFF, OP_FINALIZE, new byte[0]).getSw());
+    // ... and so is the former first step of the signature, which sent it back
+    assertEquals(SW_INCORRECT_P2,
+        cmdSet.sendRawSecure(INS_MUSIG2_SIGN_HASH, 0xFF, OP_INIT, new byte[144]).getSw());
 
-    // a tampered secnonce is refused, without consuming the id
-    byte[] secnonce = fin.getData();
-    byte[] tampered = secnonce.clone();
-    tampered[5] ^= 0x01;
     byte[] ctx = concat(sha256("b".getBytes()), sha256("ea".getBytes()), new byte[]{0x00, 0x01});
-    assertEquals(SW_OK, cmdSet.sendRawSecure(INS_MUSIG2_SIGN_HASH, 0xFF, OP_INIT, tampered).getSw());
-    assertEquals(SW_BIP327_WRONG_SECNONCE,
-        cmdSet.sendRawSecure(INS_MUSIG2_SIGN_HASH, 0xFF, OP_FINALIZE, ctx).getSw());
 
-    // flags other than 0x00/0x01 are refused, without consuming the id
+    // two nonces for the same key and the same arguments are different
+    APDUResponse again = cmdSet.sendRawSecure(INS_MUSIG2_GENERATE_NONCE, 0xFF, OP_INIT,
+        new byte[]{0x00, (byte) 0xFF, 0x00});
+    assertEquals(SW_OK, again.getSw());
+    assertFalse(Arrays.equals(Arrays.copyOf(init.getData(), 66), Arrays.copyOf(again.getData(), 66)));
+
+    // an id that was never given out is refused
+    assertEquals(SW_BIP327_INVALID_ID, cmdSet.sendRawSecure(INS_MUSIG2_SIGN_HASH, 0xFF, OP_FINALIZE,
+        concat(new byte[]{0x00, 0x00}, ctx)).getSw());
+    assertEquals(SW_BIP327_INVALID_ID, cmdSet.sendRawSecure(INS_MUSIG2_SIGN_HASH, 0xFF, OP_FINALIZE,
+        concat(new byte[]{(byte) (id[0] ^ 0x40), id[1]}, ctx)).getSw());
+
+    // malformed session values are refused, without consuming the secnonce: flags other than
+    // 0x00/0x01, b or e*a not below the group order, e*a = 0
+    byte[] order = bytes32(Vectors.SECP256K1_N);
     for (byte[] f : new byte[][]{{0x02, 0x01}, {0x00, (byte) 0xFF}}) {
-      assertEquals(SW_OK, cmdSet.sendRawSecure(INS_MUSIG2_SIGN_HASH, 0xFF, OP_INIT, secnonce).getSw());
       assertEquals(SW_INVALID_PARAMETER, cmdSet.sendRawSecure(INS_MUSIG2_SIGN_HASH, 0xFF, OP_FINALIZE,
-          concat(Arrays.copyOf(ctx, 64), f)).getSw(), "flags " + Hex.toHexString(f));
+          concat(id, Arrays.copyOf(ctx, 64), f)).getSw(), "flags " + Hex.toHexString(f));
     }
+    byte[] flags = {0x00, 0x01};
+    assertEquals(SW_INVALID_PARAMETER, cmdSet.sendRawSecure(INS_MUSIG2_SIGN_HASH, 0xFF, OP_FINALIZE,
+        concat(id, order, sha256("ea".getBytes()), flags)).getSw(), "b = n");
+    assertEquals(SW_INVALID_PARAMETER, cmdSet.sendRawSecure(INS_MUSIG2_SIGN_HASH, 0xFF, OP_FINALIZE,
+        concat(id, sha256("b".getBytes()), order, flags)).getSw(), "e*a = n");
+    assertEquals(SW_INVALID_PARAMETER, cmdSet.sendRawSecure(INS_MUSIG2_SIGN_HASH, 0xFF, OP_FINALIZE,
+        concat(id, sha256("b".getBytes()), new byte[32], flags)).getSw(), "e*a = 0");
 
     // the secnonce is bound to the key it was generated for
     cmdSet.cardBip32GetExtendedKeyRaw("m/86'/0'/0'/0/2");
-    assertEquals(SW_OK, cmdSet.sendRawSecure(INS_MUSIG2_SIGN_HASH, 0xFF, OP_INIT, secnonce).getSw());
     assertEquals(SW_BIP327_PUBKEY_MISMATCH,
-        cmdSet.sendRawSecure(INS_MUSIG2_SIGN_HASH, 0xFF, OP_FINALIZE, ctx).getSw());
+        cmdSet.sendRawSecure(INS_MUSIG2_SIGN_HASH, 0xFF, OP_FINALIZE, concat(id, ctx)).getSw());
 
-    // ... and single-use: the mismatch above already consumed its id
+    // ... and single-use: the mismatch above already consumed it
     cmdSet.cardBip32GetExtendedKeyRaw("m/86'/0'/0'/0/1");
-    assertEquals(SW_OK, cmdSet.sendRawSecure(INS_MUSIG2_SIGN_HASH, 0xFF, OP_INIT, secnonce).getSw());
     assertEquals(SW_BIP327_INVALID_ID,
-        cmdSet.sendRawSecure(INS_MUSIG2_SIGN_HASH, 0xFF, OP_FINALIZE, ctx).getSw());
+        cmdSet.sendRawSecure(INS_MUSIG2_SIGN_HASH, 0xFF, OP_FINALIZE, concat(id, ctx)).getSw());
+  }
+
+  @Test
+  @DisplayName("MuSig2 keeps 8 secnonces: one more discards the oldest")
+  @FeaturePolicies({"musig2"})
+  void musig2NonceSlotsTest() {
+    byte[] ctx = concat(sha256("b".getBytes()), sha256("ea".getBytes()), new byte[]{0x00, 0x01});
+    byte[][] ids = new byte[9][];
+    for (int i = 0; i < 9; i++) {
+      ids[i] = musig2NewSecnonce("m/86'/0'/0'/0/4");
+    }
+    // the first one was overwritten by the ninth
+    assertEquals(SW_BIP327_INVALID_ID,
+        cmdSet.sendRawSecure(INS_MUSIG2_SIGN_HASH, 0xFF, OP_FINALIZE, concat(ids[0], ctx)).getSw());
+    // the others are there: a wrong key consumes each of them without needing the RSA engine
+    cmdSet.cardBip32GetExtendedKeyRaw("m/86'/0'/0'/0/5");
+    for (int i = 1; i < 9; i++) {
+      assertEquals(SW_BIP327_PUBKEY_MISMATCH,
+          cmdSet.sendRawSecure(INS_MUSIG2_SIGN_HASH, 0xFF, OP_FINALIZE, concat(ids[i], ctx)).getSw(), "secnonce " + i);
+      assertEquals(SW_BIP327_INVALID_ID,
+          cmdSet.sendRawSecure(INS_MUSIG2_SIGN_HASH, 0xFF, OP_FINALIZE, concat(ids[i], ctx)).getSw(), "secnonce " + i);
+    }
   }
 
   @Test
   @DisplayName("MuSig2 partial signatures satisfy the BIP327 verification equation")
   @FeaturePolicies({"musig2", "rsaMult"})
   void musig2PartialSignatureTest() {
+    checkMusig2PartialSignatures(cmdSet);
+  }
+
+  /**
+   * Generates nonces and signs with them, for the four combinations of the sign flags, and
+   * checks each partial signature against the public nonce: psig*G = +-(R1 + b*R2) +- ea*P.
+   * Uses the key m/86'/0'/0'/0/3.
+   */
+  static void checkMusig2PartialSignatures(TestSatochipCommandSet cmdSet) {
     ECNamedCurveParameterSpec spec = ECNamedCurveTable.getParameterSpec("secp256k1");
     java.math.BigInteger n = Vectors.SECP256K1_N;
     byte[] pub = cmdSet.cardBip32GetExtendedKeyRaw("m/86'/0'/0'/0/3");
     ECPoint p = spec.getCurve().decodePoint(pub);
-    java.math.BigInteger b = new java.math.BigInteger(1, sha256("musig2 b".getBytes())).mod(n);
-    java.math.BigInteger ea = new java.math.BigInteger(1, sha256("musig2 ea".getBytes())).mod(n);
 
-    // (r_has_odd_y, g*gacc = -1) for each case; both flip the sign of the whole equation
-    byte[][] flags = {{0x00, 0x01}, {0x01, 0x00}};
+    // (r_has_odd_y, g*gacc is 1): the first negates the nonces, the second keeps the private key
+    byte[][] flags = {{0x00, 0x01}, {0x01, 0x00}, {0x00, 0x00}, {0x01, 0x01}};
+    int i = 0;
     for (byte[] f : flags) {
+      java.math.BigInteger b = new java.math.BigInteger(1, sha256(("musig2 b " + i).getBytes())).mod(n);
+      java.math.BigInteger ea = new java.math.BigInteger(1, sha256(("musig2 ea " + i++).getBytes())).mod(n);
       APDUResponse init = cmdSet.sendRawSecure(INS_MUSIG2_GENERATE_NONCE, 0xFF, OP_INIT,
-          new byte[]{0x00, (byte) 0xFF, 0x00});
+          concat(new byte[]{0x20}, sha256("aggpk".getBytes()), new byte[]{0x20}, sha256("msg".getBytes()), new byte[]{0x03, 1, 2, 3}));
       assertEquals(SW_OK, init.getSw());
       ECPoint r1 = spec.getCurve().decodePoint(Arrays.copyOfRange(init.getData(), 0, 33));
       ECPoint r2 = spec.getCurve().decodePoint(Arrays.copyOfRange(init.getData(), 33, 66));
-      byte[] secnonce = cmdSet.sendRawSecure(INS_MUSIG2_GENERATE_NONCE, 0xFF, OP_FINALIZE, new byte[0]).getData();
+      byte[] id = Arrays.copyOfRange(init.getData(), 66, 68);
 
-      assertEquals(SW_OK, cmdSet.sendRawSecure(INS_MUSIG2_SIGN_HASH, 0xFF, OP_INIT, secnonce).getSw());
       APDUResponse psig = cmdSet.sendRawSecure(INS_MUSIG2_SIGN_HASH, 0xFF, OP_FINALIZE,
-          concat(bytes32(b), bytes32(ea), f));
+          concat(id, bytes32(b), bytes32(ea), f));
       assertEquals(SW_OK, psig.getSw());
       assertEquals(32, psig.getData().length);
 
-      // psig*G == +/-(R1 + b*R2 + ea*P)
       ECPoint lhs = spec.getG().multiply(new java.math.BigInteger(1, psig.getData())).normalize();
-      ECPoint rhs = r1.add(r2.multiply(b)).add(p.multiply(ea));
-      if (f[0] == 0x01) rhs = rhs.negate();
-      assertEquals(rhs.normalize(), lhs, "partial signature equation, flags " + Hex.toHexString(f));
+      ECPoint re = r1.add(r2.multiply(b));
+      if (f[0] == 0x01) re = re.negate();
+      ECPoint eap = p.multiply(ea);
+      if (f[1] == 0x00) eap = eap.negate();
+      assertEquals(re.add(eap).normalize(), lhs, "partial signature equation, flags " + Hex.toHexString(f));
+
+      // the secnonce is gone
+      assertEquals(SW_BIP327_INVALID_ID, cmdSet.sendRawSecure(INS_MUSIG2_SIGN_HASH, 0xFF, OP_FINALIZE,
+          concat(id, bytes32(b), bytes32(ea), f)).getSw());
     }
   }
 
@@ -1601,14 +1651,13 @@ public class SatochipTest {
     return new byte[]{(byte) (offset >> 8), (byte) offset, (byte) (size >> 8), (byte) size};
   }
 
-  /** Generates a MuSig2 nonce for the given path and returns the 144-byte encrypted secnonce. */
+  /** Generates a MuSig2 nonce for the given path and returns the 2-byte id of its secnonce. */
   private byte[] musig2NewSecnonce(String path) {
     cmdSet.cardBip32GetExtendedKeyRaw(path);
-    assertEquals(SW_OK, cmdSet.sendRawSecure(INS_MUSIG2_GENERATE_NONCE, 0xFF, OP_INIT,
-        new byte[]{0x00, (byte) 0xFF, 0x00}).getSw());
-    APDUResponse fin = cmdSet.sendRawSecure(INS_MUSIG2_GENERATE_NONCE, 0xFF, OP_FINALIZE, new byte[0]);
-    assertEquals(SW_OK, fin.getSw());
-    return fin.getData();
+    APDUResponse init = cmdSet.sendRawSecure(INS_MUSIG2_GENERATE_NONCE, 0xFF, OP_INIT,
+        new byte[]{0x00, (byte) 0xFF, 0x00});
+    assertEquals(SW_OK, init.getSw());
+    return Arrays.copyOfRange(init.getData(), 66, 68);
   }
 
   /** 2FA approval: HMAC-SHA1(KEY_2FA, value(32b) | 32 bytes of padding). */

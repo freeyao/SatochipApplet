@@ -114,7 +114,7 @@ public class Satochip extends javacard.framework.Applet {
     // 0.16-0.1: security fixes & hardening (ResetKey 2FA HMAC fix, EC point validation, Musig2SignHash 2FA fix, MuSig2 nonce counter overflow fix, resetToFactory completion, BIP341 taproot tweak fix, ImportKey hardening, constant-time MAC comparisons, reset-to-factory refactoring, authentikey mgmt, transient AES session keys, removal of ParseTransaction/SignTransaction/signMessage, add GET_RANDOM, single PIN/PUK mgmt, ...)
     // 0.17-0.1: self-built ECDSA for SignTransactionHash (BIP461: RFC 6979 nonce, low-r, low-S, verified before output) instead of the platform Signature engine; the three self-signatures are removed and the full public key is returned instead (getBIP32ExtendedKey, getPublicKeyFromPrivate, InitiateSecureChannel: new response formats)
     private final static byte PROTOCOL_MAJOR_VERSION = (byte) 0; 
-    private final static byte PROTOCOL_MINOR_VERSION = (byte) 19;
+    private final static byte PROTOCOL_MINOR_VERSION = (byte) 20;
     private final static byte APPLET_MAJOR_VERSION = (byte) 0;
     private final static byte APPLET_MINOR_VERSION = (byte) 1;
 
@@ -316,9 +316,7 @@ public class Satochip extends javacard.framework.Applet {
     private final static short SW_ECDSA_NONCE_ERROR = (short) 0x9C4E;
 
     /** MuSig2 errors **/
-    private final static short SW_BIP327_WRONG_SECNONCE = (short) 0x9C44;
     private final static short SW_BIP327_PUBKEY_MISMATCH= (short) 0x9C45;
-    private final static short SW_BIP327_COUNTER_OVERFLOW= (short) 0x9C46;
     private final static short SW_BIP327_INVALID_ID= (short) 0x9C47;
 
     /****************************************
@@ -371,7 +369,6 @@ public class Satochip extends javacard.framework.Applet {
     // point addition s*G + Q (ALG_EC_PACE_GM), for the verification of the self-built ECDSA signatures
     private KeyAgreement keyAgreementAdd;
     private Signature sigECDSA;
-    private Signature sigAESMAC;
 
     /*********************************************
      *  BIP32 Hierarchical Deterministic Wallet  *
@@ -443,34 +440,60 @@ public class Satochip extends javacard.framework.Applet {
     // MuSig/nonce offset 9, length 11
     private static final byte[] TAGS_MUSIG2 = {'M','u','S','i','g','/','a','u','x',  'M','u','S','i','g','/','n','o','n','c','e'};
 
-    private AESKey bip327_encryptkey; // used with sc_aes128_cbc to encrypt secnonce for export
-    private AESKey bip327_mackey; // used with sigAESMAC to MAC encrypted secnonce for export
-
-    // store a list of valid (not used) secnonce IDs. An entry of the array is overwritten each time a new secnonce is generated.
+    /*
+     * Secret nonces (secnonces) never leave the card. Musig2GenerateNonce() stores one in a slot
+     * of musig2Slots (persistent) and returns its id; Musig2SignHash() takes it out and erases the
+     * slot before computing anything with it, so that a secnonce that was used no longer exists
+     * anywhere: no fault can make it usable a second time (a second partial signature with the
+     * same secnonce and another challenge gives the private key away).
+     *
+     * slot = [ id(2b) | pk(33b) | k1(32b) | k1(32b) | k2(32b) | k2(32b) ]
+     *   id: 0 if the slot is empty or used. Slot number = id & (MUSIG2_NB_SLOTS-1): a new
+     *       secnonce overwrites the oldest one, at most MUSIG2_NB_SLOTS sessions are pending.
+     *   pk: the compressed public key of the signing key, as in the secnonce of BIP327
+     *   k1, k2 are held twice: the first copy goes into the partial signature, the second one
+     *       into its verification (see musig2Sign()).
+     */
+    public static final byte MUSIG2_NB_SLOTS = (byte)8; // must be a power of 2
+    private static final short MUSIG2_SLOT_PK = (short)2;
+    private static final short MUSIG2_SLOT_K = (short)35;
+    private static final short MUSIG2_SLOT_SIZE = (short)163;
+    private byte[] musig2Slots;
+    // id of the next secnonce: 1..0xFFFF, 0 is the id of an empty slot
     private short bip327_counter = (short)1;
-    private short[] bip327_valid_ids;
-    public static final byte BIP327_MAX_NB_ID = (byte)16; // NOTE: should be a power of 2
+    /*
+     * Counter mixed into every nonce derivation, with the platform's random data (BIP327:
+     * NonceGen with a counter in extra_in). Either one not repeating is enough for the nonces
+     * not to repeat. Persistent, incremented before each use, never reset: not when the seed
+     * is reset, as an imported key can outlive it.
+     */
+    private byte[] musig2NonceCounter;
+    private static final short MUSIG2_COUNTER_SIZE = (short)8;
 
-    // recvBuffer offset values to store intermediate values
-    public static final short OFFSET_BIP327_K1= (short)0;
-    public static final short OFFSET_BIP327_K2= (short)32;
-    public static final short OFFSET_BIP327_RAND= (short)64; // bytes 64->64+176 are used to store the nonce to hash
+    // recvBuffer offsets of the nonce derivation: the hashed message starts at OFFSET_BIP327_RAND
+    // [ rand(32b) | 0x21 | pk(33b) | len(aggpk)(1b) | aggpk | m_prefixed | len(extra_in)(4b) | extra_in | counter(8b) | i(1b) ]
+    public static final short OFFSET_BIP327_RAND= (short)64;
     public static final short OFFSET_BIP327_RAND_HASH= (short)96;
     public static final short OFFSET_BIP327_PK= (short)97;
-    public static final short OFFSET_BIP327_ID= (short)97;
-    public static final short OFFSET_BIP327_PADDING= (short)99;
-    public static final short OFFSET_BIP327_IV= (short)112;
-    public static final short OFFSET_BIP327_MAC= (short)128;
+    // ... then, once the nonces are derived, of the compressed points R1 | R2 (66b)
+    private static final short OFFSET_BIP327_PUBNONCE= (short)130;
 
-    // buffer offset for input value to Musig2SignHash()
-    // buffer = [cla, ins, p1, p2, lc] + [b(32b) | ea(32b) | r_has_even_y(1b) | ggacc_is_1(1b) | k1(32b) | k2(32b) | pk(33b)]
-    public static final short OFFSET_BIP327_SIGN_B = ISO7816.OFFSET_CDATA;
-    public static final short OFFSET_BIP327_SIGN_EA = (short)(ISO7816.OFFSET_CDATA+32);
-    public static final short OFFSET_BIP327_SIGN_R_EVENNESS = (short)(ISO7816.OFFSET_CDATA + 64);
-    public static final short OFFSET_BIP327_SIGN_GGAC = (short)(ISO7816.OFFSET_CDATA + 65);
-    public static final short OFFSET_BIP327_SIGN_K1_ = (short)(ISO7816.OFFSET_CDATA + 66);
-    public static final short OFFSET_BIP327_SIGN_K2_ = (short)(ISO7816.OFFSET_CDATA + 98);
-    public static final short OFFSET_BIP327_SIGN_PK = (short)(ISO7816.OFFSET_CDATA + 130);
+    // the four nonce scalars in RAM, in the order of the slot: k1 | k1 | k2 | k2
+    private static final short MUSIG2_RAM_K = (short)192;
+    private static final short MUSIG2_RAM_K_SIZE = (short)128;
+
+    // input of Musig2SignHash(): buffer = [cla, ins, p1, p2, lc] + [id(2b) | b(32b) | ea(32b) | r_has_odd_y(1b) | ggacc_is_1(1b)]
+    public static final short OFFSET_BIP327_SIGN_ID = ISO7816.OFFSET_CDATA;
+    public static final short OFFSET_BIP327_SIGN_B = (short)(ISO7816.OFFSET_CDATA+2);
+    public static final short OFFSET_BIP327_SIGN_EA = (short)(ISO7816.OFFSET_CDATA+34);
+    public static final short OFFSET_BIP327_SIGN_R_EVENNESS = (short)(ISO7816.OFFSET_CDATA + 66);
+    public static final short OFFSET_BIP327_SIGN_GGAC = (short)(ISO7816.OFFSET_CDATA + 67);
+    private static final short MUSIG2_SIGN_DATA_SIZE = (short)68;
+    // recvBuffer offsets of musig2Sign(): b and ea are copied out of the APDU buffer, which the
+    // verification overwrites
+    private static final short MUSIG2_OFFSET_B = (short)96;
+    private static final short MUSIG2_OFFSET_EA = (short)128;
+    private static final short MUSIG2_OFFSET_D = (short)160;
 
     /*********************************************
      *               PKI objects                 *
@@ -584,7 +607,6 @@ public class Satochip extends javacard.framework.Applet {
         // common cryptographic objects
         randomData = RandomData.getInstance(RandomData.ALG_SECURE_RANDOM);
         sigECDSA= Signature.getInstance(Signature.ALG_ECDSA_SHA_256, false);
-        sigAESMAC= Signature.getInstance(Signature.ALG_AES_MAC_128_NOPAD, false);
         sha256= MessageDigest.getInstance(MessageDigest.ALG_SHA_256, false);
         HmacSha160.init(tmpBuffer);
         HmacSha512.init(tmpBuffer);
@@ -666,17 +688,9 @@ public class Satochip extends javacard.framework.Applet {
         aes128_cbc= Cipher.getInstance(Cipher.ALG_AES_BLOCK_128_CBC_NOPAD, false);
         key_2FA= (AESKey) KeyBuilder.buildKey(KeyBuilder.TYPE_AES, KeyBuilder.LENGTH_AES_128, false);
 
-        // MuSig2 nonce encryption/decryption
-        bip327_encryptkey = (AESKey) KeyBuilder.buildKey(KeyBuilder.TYPE_AES, KeyBuilder.LENGTH_AES_128, false);
-        randomData.generateData(recvBuffer, (short) 0, (short)16);
-        bip327_encryptkey.setKey(recvBuffer, (short)0);
-        // MuSig2 encrypted nonce MAC
-        bip327_mackey = (AESKey) KeyBuilder.buildKey(KeyBuilder.TYPE_AES, KeyBuilder.LENGTH_AES_128, false);
-        randomData.generateData(recvBuffer, (short) 0, (short)16);
-        bip327_mackey.setKey(recvBuffer, (short)0);
-
-        // MuSig2 array storing 2-byte IDs of valid secnonce. Each id is made of 1 short.
-        bip327_valid_ids = new short[BIP327_MAX_NB_ID];
+        // MuSig2: secnonce slots and nonce counter (persistent)
+        musig2Slots = new byte[(short)(MUSIG2_NB_SLOTS * MUSIG2_SLOT_SIZE)];
+        musig2NonceCounter = new byte[MUSIG2_COUNTER_SIZE];
 
         // card label
         card_label = new byte[MAX_CARD_LABEL_SIZE];  
@@ -1617,26 +1631,12 @@ public class Satochip extends javacard.framework.Applet {
     }
     
     /**
-     * Invalidates all MuSig2 secnonces and resets the nonce id state:
-     * clears the list of valid secnonce ids, restarts the id counter at 1 and
-     * generates new secnonce encryption/MAC keys, so that all previously exported
-     * encrypted secnonces become unusable.
-     * Used by Musig2GenerateNonce() when the id counter overflows, and by
-     * resetSeed() (hence also resetToFactory()) to clear the MuSig2 state.
-     * Note: uses recvBuffer as scratch (first 16 bytes).
+     * Erases all the MuSig2 secnonces stored in the card. Used by resetSeed() (hence also
+     * resetToFactory()). The id counter and the nonce counter are left as they are: neither
+     * may ever go back.
      */
     private void resetMusig2NonceState(){
-        // invalidate all stored ids
-        for (short i=(short)0; i<BIP327_MAX_NB_ID; i++){
-            bip327_valid_ids[i] = 0;
-        }
-        // restart counter at 1 since id 0 is reserved to represent NULL id
-        bip327_counter = (short)1;
-        // generate new encryption & MAC keys, so that all externally stored encrypted secnonces are invalidated
-        randomData.generateData(recvBuffer, (short) 0, (short)16);
-        bip327_encryptkey.setKey(recvBuffer, (short)0);
-        randomData.generateData(recvBuffer, (short) 0, (short)16);
-        bip327_mackey.setKey(recvBuffer, (short)0);
+        Util.arrayFillNonAtomic(musig2Slots, (short)0, (short)musig2Slots.length, (byte)0);
     }
     
     /****************************************
@@ -2748,7 +2748,8 @@ public class Satochip extends javacard.framework.Applet {
     private static final short ECDSA_RAM_INV = (short)64;
     private static final short ECDSA_RAM_T = (short)128;
     private static final short ECDSA_RAM_V = (short)160;
-    private static final short ECDSA_RAM_SIZE = (short)192;
+    // 192..320: the four nonce scalars of a MuSig2 secnonce (MUSIG2_RAM_K)
+    private static final short ECDSA_RAM_SIZE = (short)320;
     /** Scratch of the self-built ECDSA that is neither recvBuffer nor the APDU buffer: RAM only, no persistent fallback. */
     private byte[] ecdsaRam;
     /** The scalar 1: what a persistent scratch key is overwritten with after use (see clearEphemeralKey()). */
@@ -3615,26 +3616,29 @@ public class Satochip extends javacard.framework.Applet {
      ****************************************/
 
     /**
-     * This function generates a secure nonce as used in MuSig2.
+     * This function generates a secret nonce (secnonce) as used in MuSig2, and returns the
+     * corresponding public nonce (pubnonce).
      * See https://github.com/bitcoin/bips/blob/master/bip-0327.mediawiki
      *
      * A private key must first be available, either from a keyslot or
      * derived from a BIP32 seed using getBIP32ExtendedKey() in the same session.
      *
-     * The function returns the corresponding public nonce (pubnonce).
-     * The secret nonce secnonce is stored for use in the signing phase.
+     * The secnonce stays in the card (see musig2Slots): the host gets its id, to be given to
+     * Musig2SignHash(). It can be used once, with the key it was generated for. At most
+     * MUSIG2_NB_SLOTS secnonces are pending at a time: generating one more discards the oldest.
      *
-
+     * The nonces are derived as in BIP327 NonceGen, from 32 bytes of the platform's random
+     * generator, the private key, pk, aggpk, m and extra_in, where the card appends its own
+     * 8-byte counter to the extra_in of the host (see musig2NonceCounter).
      *
      * ins: 0x7E
      * p1: key number or 0xFF for the last derived Bip32 extended key
-     * p2: OP_INIT | OP_FINALIZE
-     * data (init): [aggpk_size(1b) | aggpk | msg_size (1b) | msg | extra_size(1b) | extra_bytes]
-     * data (finalize): []
+     * p2: OP_INIT (0x01). Anything else is rejected with SW_INCORRECT_P2: up to protocol 0.19
+     *     OP_FINALIZE returned the encrypted secnonce, which no longer exists.
+     * data: [aggpk_size(1b) | aggpk | msg_size (1b) | msg | extra_size(1b) | extra_bytes]
+     *       aggpk_size: 0 or 32; msg_size: 0..32, or 0xFF for "no message"; extra_size: 0..32
      *
-     * return (init): [pubnonce(66b) | id(2b)]
-     * return (finalize): [ encrypted_secnonce(144b) ]
-     *
+     * return: [pubnonce(66b) | id(2b)]
      */
     private short Musig2GenerateNonce(APDU apdu, byte[] buffer) {
 
@@ -3646,195 +3650,203 @@ public class Satochip extends javacard.framework.Applet {
         if (feature_musig2_policy != FEATURE_ENABLED)
             ISOException.throwIt(SW_FEATURE_DISABLED);
 
-        // P2 defines the operation state (init or finalize)
-        byte p2 = buffer[ISO7816.OFFSET_P2];
-        if (p2 == OP_FINALIZE) {
-            // at this point, recvBuffer should contain the encrypted secnonce after having exported pubnonce in OP_INIT phase
-            // recvBuffer = [ k1(32b) | k2(32b) | rand(32b) | 0x33(1b) | pk(33b) | 0x15_padding(15b) | IV(16b) | mac(16b) ]
-
-            // check MAC then return encrypted nonce
-            sigAESMAC.init(bip327_mackey, Signature.MODE_VERIFY);
-            boolean isOk = sigAESMAC.verify(recvBuffer, OFFSET_BIP327_K1, (short) 128, recvBuffer, OFFSET_BIP327_MAC, (short)16);
-            if (!isOk)
-                ISOException.throwIt(SW_BIP327_WRONG_SECNONCE);
-
-            Util.arrayCopyNonAtomic(recvBuffer, OFFSET_BIP327_K1, buffer, (short)0, (short)144);
-            return (short)144;
-        }
-
-        // OP_INIT
+        if (buffer[ISO7816.OFFSET_P2] != OP_INIT)
+            ISOException.throwIt(SW_INCORRECT_P2);
 
         // P1 defines which privkey is used
         ECPrivateKey privkey = getSigningKey(buffer[ISO7816.OFFSET_P1]);
 
-        // generate 32-byte randomness (rand')
-        randomData.generateData(recvBuffer,OFFSET_BIP327_RAND, (short)32);
+        // rand': 32 bytes of the platform's random generator
+        randomData.generateData(recvBuffer, OFFSET_BIP327_RAND, (short)32);
 
-        // hash randomness
-        schnorr_hash_tag(TAGS_MUSIG2, (short)0, (short)9, recvBuffer, OFFSET_BIP327_RAND, (short)32, recvBuffer, OFFSET_BIP327_RAND_HASH);
-
-        // overwrite rand' with privkey (sk) in buffer
-        privkey.getS(recvBuffer,OFFSET_BIP327_RAND);
-
-        // xor privkey with hashed randomness
-        // rand = sk ^ hash_MuSig/aux(rand')
-        short i;
-        for (i = (short)0; i < (short)32; i++){
-            recvBuffer[(short)(OFFSET_BIP327_RAND+i)] = (byte)(recvBuffer[(short)(OFFSET_BIP327_RAND+i)] ^ recvBuffer[(short)(OFFSET_BIP327_RAND_HASH+i)]);
-        }
-
-        // compute pubkey pk and overwrite hashed randomness
-        recvBuffer[OFFSET_BIP327_RAND_HASH] = (byte)33; // size_pk
-        getPublicKey(privkey, recvBuffer, OFFSET_BIP327_PK); // uncompressed pubkey (65b)
-        setCompressionByte(recvBuffer, OFFSET_BIP327_PK);
-        short recvOffset = OFFSET_BIP327_PK;
-        recvOffset+=33;
-
-        // get data from incoming apdu
-        short buffer_offset = ISO7816.OFFSET_CDATA;
-        short bytesLeft = Util.makeShort((byte) 0x00, buffer[ISO7816.OFFSET_LC]);
-
-        // parse aggpk
-        if (bytesLeft<1)
-            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
-        byte aggpk_size = buffer[buffer_offset++];
-        bytesLeft--;
-        if (aggpk_size!=0 && aggpk_size!=32)
-            ISOException.throwIt(SW_INVALID_PARAMETER);
-        if (bytesLeft<aggpk_size)
-            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
-        recvBuffer[recvOffset++] = aggpk_size;
-        Util.arrayCopyNonAtomic(buffer, buffer_offset, recvBuffer, recvOffset, (short)aggpk_size);
-        recvOffset+=aggpk_size;
-        buffer_offset+=aggpk_size;
-        bytesLeft-=aggpk_size;
-
-        // parse m
-        if (bytesLeft<1)
-            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
-        byte m_size = buffer[buffer_offset++];
-        bytesLeft--;
-        if (bytesLeft<m_size)
-            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
-        if (m_size<0x00) {
-            // 0xff is interpreted as "no message provided", which is not the same as a message of size 0
-            recvBuffer[recvOffset++] = 0x00;
-        } else if (m_size==0x00){
-            recvBuffer[recvOffset++] = 0x01;
-            Util.arrayFillNonAtomic(recvBuffer, recvOffset, (short)8, (byte)0x00);
-            recvOffset+=8;
-        } else if (m_size>0){
-            // note: we suppose message is max 32 bytes...
-            if (m_size>32)
-                ISOException.throwIt(SW_INVALID_PARAMETER);
-            recvBuffer[recvOffset++] = 0x01;
-            Util.arrayFillNonAtomic(recvBuffer, recvOffset, (short)7, (byte)0x00);
-            recvOffset+=7;
-            recvBuffer[recvOffset++] = m_size; // most significant byte first
-            Util.arrayCopyNonAtomic(buffer, buffer_offset, recvBuffer, recvOffset, (short)m_size);
-            recvOffset+=m_size;
-            buffer_offset+=m_size;
-            bytesLeft-=m_size;
-        }
-
-        // param extra_in
-        if (bytesLeft<1)
-            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
-        byte extra_size = buffer[buffer_offset++];
-        bytesLeft--;
-        if (bytesLeft<extra_size)
-            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
-        // note: we suppose extra_in is max 32 bytes...
-        if (extra_size<0 || extra_size>32)
-            ISOException.throwIt(SW_INVALID_PARAMETER);
-        Util.arrayFillNonAtomic(recvBuffer, recvOffset, (short)3, (byte)0x00);
-        recvOffset+=3;
-        recvBuffer[recvOffset++] = extra_size; // most significant byte first
-        Util.arrayCopyNonAtomic(buffer, buffer_offset, recvBuffer, recvOffset, (short)extra_size);
-        recvOffset+=extra_size;
-        buffer_offset+=extra_size;
-        bytesLeft-=extra_size;
-
-        // compute k1
-        recvBuffer[recvOffset] = (byte) 0x00;
-
-        schnorr_hash_tag(TAGS_MUSIG2, (short)9, (short)11, recvBuffer, OFFSET_BIP327_RAND, (short)(recvOffset+1-OFFSET_BIP327_RAND), recvBuffer, OFFSET_BIP327_K1);
-        // compute k2
-        recvBuffer[recvOffset] = (byte) 0x01;
-        schnorr_hash_tag(TAGS_MUSIG2, (short)9, (short)11, recvBuffer, OFFSET_BIP327_RAND, (short)(recvOffset+1-OFFSET_BIP327_RAND), recvBuffer, OFFSET_BIP327_K2);
-        // todo: check not null (very low probability?)
-
-        // at this point, recvBuffer = [ k1(32b) | k2(32b) | rand(32b) | 0x33 | pk(33b) | len(aggpk)(1b) | aggpk(32) | m_prefixed | extra_in_prefixed | 0x00 or 0x01 ]
-
-        // save pubnonce in returned buffer
-        // compute R1
-        buffer_offset = 0x00;
-        if (ephemeral_privkey_transient) {
-            Secp256k1.setCommonCurveParameters(ephemeral_privkey);
-        }
-        ephemeral_privkey.setS(recvBuffer, OFFSET_BIP327_K1, BIP32_KEY_SIZE);
-        getPublicKey(ephemeral_privkey, buffer, (short)0); // uncompressed pubkey (65b)
-        setCompressionByte(buffer, (short)0);
-
-        // compute R2
-        buffer_offset = (short)33;
-        ephemeral_privkey.setS(recvBuffer, OFFSET_BIP327_K2, BIP32_KEY_SIZE);
-        getPublicKey(ephemeral_privkey, buffer, buffer_offset); // uncompressed pubkey (65b)
-        setCompressionByte(buffer, buffer_offset);
-        buffer_offset+=33;
-        // the scratch EC key holds the secret nonce k2
-        clearEphemeralKey();
-
-        // save id counter to buffer
-        Util.setShort(buffer, buffer_offset, bip327_counter);
-        buffer_offset+=2;
-
-        // save secnonce in recvBuffer for next step
-        // move pk so that it is located next to [k1 | k2 ]
-        Util.arrayCopyNonAtomic(recvBuffer, OFFSET_BIP327_PK, recvBuffer, OFFSET_BIP327_RAND, (short)64);
-
-        // check id counter
-        if (bip327_counter == 0) {
-            // if 2-byte counter is 0, we must have overflowed: since we have used all possible
-            // IDs, we invalidate all stored IDs and all externally stored encrypted secnonces
-            // (new encryption & MAC keys), and restart the counter at 1
-            resetMusig2NonceState();
-
-            // return error
-            ISOException.throwIt(SW_BIP327_COUNTER_OVERFLOW);
-        }
-
-        // save the 2-byte id next to pk. This id is also stored in the card and erased after the signature phase, to avoid nonce reuse.
-        Util.setShort(recvBuffer, OFFSET_BIP327_ID, bip327_counter);
-        // save id to internal state to track reuse of secnonce, new entry overwite older entries if necessary.
-        // note: use a bitmask instead of modulo so that the index stays in range even when the
-        // counter is negative (short overflow after 32768 generations). BIP327_MAX_NB_ID is a
-        // power of 2, so consecutive ids always map to distinct slots. Ids remain unique bit
-        // patterns until the counter wraps to 0, which is handled above (keys are rotated).
-        bip327_valid_ids[(short) (bip327_counter & (BIP327_MAX_NB_ID-1))] = bip327_counter;
-        // increment counter
-        bip327_counter++;
-
-        // add 13-byte padding to reach 112 bytes of data to encrypt
-        Util.arrayFillNonAtomic(recvBuffer, OFFSET_BIP327_PADDING, (short)13, (byte)13);
-
-        // random 16-byte IV
-        randomData.generateData(recvBuffer,OFFSET_BIP327_IV, (short)16);
-
-        // encrypt [ k1 | k2 | pk | id | padding ] using a key only known to the applet
-        // we reuse the cipher object of the secure channel, since it is used in a stateless way.
-        sc_aes128_cbc.init(bip327_encryptkey, Cipher.MODE_ENCRYPT, recvBuffer, OFFSET_BIP327_IV, AES_IV_SIZE);
-        sc_aes128_cbc.doFinal(recvBuffer, OFFSET_BIP327_K1, (short)112, recvBuffer, OFFSET_BIP327_K1);
-
-        // compute MAC over encrypted secnonce+IV
-        sigAESMAC.init(bip327_mackey, Signature.MODE_SIGN);
-        sigAESMAC.sign(recvBuffer, OFFSET_BIP327_K1, (short)128, recvBuffer, OFFSET_BIP327_MAC);
-
-        // at this point, recvBuffer = [ k1(32b) | k2(32b) | pk(33b) | id(2b) | 0x13_padding(13b) | IV(16b) | mac(16b) ]
-        // and buffer = [ k1(33b) | k2(33b) | id(2b) ]
-        return (short)68;
+        return musig2NonceGen(buffer, privkey, true);
     }
 
+    /**
+     * BIP327 NonceGen for the key privkey, with rand' taken from recvBuffer[OFFSET_BIP327_RAND]
+     * and the other arguments from the APDU data (see Musig2GenerateNonce()). With cardCounter
+     * set, the card's nonce counter is incremented and appended to extra_in. Stores the secnonce
+     * in a slot and writes [pubnonce(66b) | id(2b)] at buffer[0].
+     *
+     * What differs from a plain reading of BIP327:
+     *   - k1 and k2 are hashed on the SHA-256 backend selected at install, as their input holds
+     *     the private key (masked by a hash of rand'). Each is hashed twice and the two results
+     *     are compared;
+     *   - R1 = k1*G and R2 = k2*G are computed as (k * w^-1) * (w*G) for a random w, so that
+     *     the EC engine does not receive the nonces (see ecdsaComputeRPoint(), which also
+     *     compares the two computations of each nonce again);
+     *   - k = 0 or k >= n is refused (BIP327 reduces mod n and fails on 0; the probability of
+     *     either is negligible).
+     *
+     * @return 68
+     */
+    private short musig2NonceGen(byte[] buffer, ECPrivateKey privkey, boolean cardCounter) {
+        if ((short)buffer.length < ECDSA_APDU_SIZE)
+            ISOException.throwIt(SW_INTERNAL_ERROR);
+
+        // from here on, the scratch buffers hold secrets (the private key, the nonces): they are
+        // erased in the finally block below, also on error
+        short sizeout = (short)0;
+        short slotOff = (short)-1;
+        try {
+            // rand = sk ^ hash_MuSig/aux(rand')
+            schnorr_hash_tag(TAGS_MUSIG2, (short)0, (short)9, recvBuffer, OFFSET_BIP327_RAND, (short)32, recvBuffer, OFFSET_BIP327_RAND_HASH);
+            privkey.getS(recvBuffer, OFFSET_BIP327_RAND);
+            short i;
+            for (i = (short)0; i < (short)32; i++){
+                recvBuffer[(short)(OFFSET_BIP327_RAND+i)] ^= recvBuffer[(short)(OFFSET_BIP327_RAND_HASH+i)];
+            }
+
+            // pk, compressed, overwrites the hashed randomness
+            recvBuffer[OFFSET_BIP327_RAND_HASH] = (byte)33; // size_pk
+            getPublicKey(privkey, recvBuffer, OFFSET_BIP327_PK); // uncompressed pubkey (65b)
+            setCompressionByte(recvBuffer, OFFSET_BIP327_PK);
+            short recvOffset = (short)(OFFSET_BIP327_PK+33);
+
+            // get data from incoming apdu
+            short buffer_offset = ISO7816.OFFSET_CDATA;
+            short bytesLeft = Util.makeShort((byte) 0x00, buffer[ISO7816.OFFSET_LC]);
+
+            // parse aggpk
+            if (bytesLeft<1)
+                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+            byte aggpk_size = buffer[buffer_offset++];
+            bytesLeft--;
+            if (aggpk_size!=0 && aggpk_size!=32)
+                ISOException.throwIt(SW_INVALID_PARAMETER);
+            if (bytesLeft<aggpk_size)
+                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+            recvBuffer[recvOffset++] = aggpk_size;
+            Util.arrayCopyNonAtomic(buffer, buffer_offset, recvBuffer, recvOffset, (short)aggpk_size);
+            recvOffset+=aggpk_size;
+            buffer_offset+=aggpk_size;
+            bytesLeft-=aggpk_size;
+
+            // parse m
+            if (bytesLeft<1)
+                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+            byte m_size = buffer[buffer_offset++];
+            bytesLeft--;
+            if (m_size<0x00) {
+                // 0xff is interpreted as "no message provided", which is not the same as a message of size 0
+                recvBuffer[recvOffset++] = 0x00;
+            } else {
+                // note: we suppose message is max 32 bytes...
+                if (m_size>32)
+                    ISOException.throwIt(SW_INVALID_PARAMETER);
+                if (bytesLeft<m_size)
+                    ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+                recvBuffer[recvOffset++] = 0x01;
+                Util.arrayFillNonAtomic(recvBuffer, recvOffset, (short)7, (byte)0x00);
+                recvOffset+=7;
+                recvBuffer[recvOffset++] = m_size; // 8-byte length, most significant byte first
+                Util.arrayCopyNonAtomic(buffer, buffer_offset, recvBuffer, recvOffset, (short)m_size);
+                recvOffset+=m_size;
+                buffer_offset+=m_size;
+                bytesLeft-=m_size;
+            }
+
+            // param extra_in: the host's bytes, then the card's counter
+            if (bytesLeft<1)
+                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+            byte extra_size = buffer[buffer_offset++];
+            bytesLeft--;
+            // note: we suppose extra_in is max 32 bytes...
+            if (extra_size<0 || extra_size>32)
+                ISOException.throwIt(SW_INVALID_PARAMETER);
+            if (bytesLeft<extra_size)
+                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+            Util.arrayFillNonAtomic(recvBuffer, recvOffset, (short)3, (byte)0x00);
+            recvOffset+=3;
+            recvBuffer[recvOffset++] = (byte)(extra_size + (cardCounter ? MUSIG2_COUNTER_SIZE : (short)0)); // 4-byte length
+            Util.arrayCopyNonAtomic(buffer, buffer_offset, recvBuffer, recvOffset, (short)extra_size);
+            recvOffset+=extra_size;
+            if (cardCounter) {
+                // a counter value is never handed out twice: it is incremented, atomically,
+                // before it is used
+                JCSystem.beginTransaction();
+                for (i = (short)(MUSIG2_COUNTER_SIZE-1); i >= (short)0; i--) {
+                    musig2NonceCounter[i]++;
+                    if (musig2NonceCounter[i] != (byte)0)
+                        break;
+                }
+                JCSystem.commitTransaction();
+                Util.arrayCopyNonAtomic(musig2NonceCounter, (short)0, recvBuffer, recvOffset, MUSIG2_COUNTER_SIZE);
+                recvOffset+=MUSIG2_COUNTER_SIZE;
+            }
+
+            // k_i = int(hash_MuSig/nonce(rand || len(pk) || pk || len(aggpk) || aggpk || m_prefixed || len(extra_in) || extra_in || i-1))
+            // each one twice: ecdsaRam = [ ... | k1 | k1 | k2 | k2 ]
+            short msgSize = (short)(recvOffset+1-OFFSET_BIP327_RAND);
+            for (i = (short)0; i < (short)2; i++) {
+                recvBuffer[recvOffset] = (byte)i;
+                musig2NonceHash(msgSize, (short)(MUSIG2_RAM_K + 64*i));
+                musig2NonceHash(msgSize, (short)(MUSIG2_RAM_K + 64*i + 32));
+            }
+            // the hashed message held rand; pk stays where it is, for the slot
+            Util.arrayFillNonAtomic(recvBuffer, OFFSET_BIP327_RAND, (short)33, (byte)0);
+            Util.arrayFillNonAtomic(recvBuffer, (short)(OFFSET_BIP327_PK+33), (short)(recvOffset+1-OFFSET_BIP327_PK-33), (byte)0);
+
+            for (i = (short)0; i < (short)2; i++) {
+                short kOff = (short)(MUSIG2_RAM_K + 64*i);
+                // nothing is decided from a nonce before its two computations are compared
+                if (!arrayCompareConstantTime(ecdsaRam, kOff, ecdsaRam, (short)(kOff+32), (short)32))
+                    ISOException.throwIt(SW_ECDSA_VERIFY_FAILED);
+                // secret: compare in constant time
+                if (Biginteger.isZeroCT(ecdsaRam, kOff, (short)32)
+                        | !Biginteger.lessThanCT(ecdsaRam, kOff, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32)){
+                    ISOException.throwIt(SW_SCHNORR_INVALID_NONCE);
+                }
+            }
+
+            // R_i = k_i*G, compressed, to recvBuffer[OFFSET_BIP327_PUBNONCE + 33*i]
+            for (i = (short)0; i < (short)2; i++) {
+                short kOff = (short)(MUSIG2_RAM_K + 64*i);
+                Util.arrayCopyNonAtomic(ecdsaRam, kOff, recvBuffer, ECDSA_OFFSET_K, (short)32);
+                Util.arrayCopyNonAtomic(ecdsaRam, (short)(kOff+32), ecdsaRam, ECDSA_RAM_K2, (short)32);
+                ecdsaComputeRPoint(buffer);
+                setCompressionByte(buffer, ECDSA_APDU_R);
+                Util.arrayCopyNonAtomic(buffer, ECDSA_APDU_R, recvBuffer, (short)(OFFSET_BIP327_PUBNONCE + 33*i), (short)33);
+            }
+
+            // store the secnonce: the slot is emptied first and gets its id last, so that a
+            // slot with an id always holds a complete secnonce
+            short id = bip327_counter;
+            if (id == (short)0)
+                id = (short)1; // 0 is the id of an empty slot
+            slotOff = (short)((id & (MUSIG2_NB_SLOTS-1)) * MUSIG2_SLOT_SIZE);
+            Util.setShort(musig2Slots, slotOff, (short)0);
+            Util.arrayCopyNonAtomic(recvBuffer, OFFSET_BIP327_PK, musig2Slots, (short)(slotOff+MUSIG2_SLOT_PK), (short)33);
+            Util.arrayCopyNonAtomic(ecdsaRam, MUSIG2_RAM_K, musig2Slots, (short)(slotOff+MUSIG2_SLOT_K), MUSIG2_RAM_K_SIZE);
+            bip327_counter = (short)(id+1);
+            Util.setShort(musig2Slots, slotOff, id);
+
+            // [pubnonce(66b) | id(2b)]
+            Util.arrayCopyNonAtomic(recvBuffer, OFFSET_BIP327_PUBNONCE, buffer, (short)0, (short)66);
+            Util.setShort(buffer, (short)66, id);
+            sizeout = (short)68;
+        } finally {
+            // a slot that was written but did not get its id holds a secnonce nobody can use
+            if (slotOff >= (short)0 && sizeout == (short)0)
+                Util.arrayFillNonAtomic(musig2Slots, slotOff, MUSIG2_SLOT_SIZE, (byte)0);
+            Sha256.clear();
+            clearSigningScratch(buffer, sizeout, ECDSA_APDU_SIZE);
+        }
+        return sizeout;
+    }
+
+    /**
+     * ecdsaRam[dstOff..+32) = hash_MuSig/nonce(recvBuffer[OFFSET_BIP327_RAND..+msgSize)), on the
+     * SHA-256 backend selected at install. SHA256(tag) is public: platform. Uses tmpBuffer[0..32).
+     */
+    private void musig2NonceHash(short msgSize, short dstOff) {
+        sha256.reset();
+        sha256.doFinal(TAGS_MUSIG2, (short)9, (short)11, tmpBuffer, (short)0);
+        Sha256.reset();
+        Sha256.update(tmpBuffer, (short)0, (short)32);
+        Sha256.update(tmpBuffer, (short)0, (short)32);
+        Sha256.doFinal(recvBuffer, OFFSET_BIP327_RAND, msgSize, ecdsaRam, dstOff);
+    }
 
     /**
      * This function performs partial signature as specified in MuSig2.
@@ -3843,21 +3855,23 @@ public class Satochip extends javacard.framework.Applet {
      * A private key must first be available, either from a keyslot or
      * derived from a BIP32 seed using getBIP32ExtendedKey() in the same session.
      *
-     * The function returns the partial psig signature for corresponding key and given secnonce & session context.
-     * The secret nonce secnonce must be generated from the Musig2GenerateNonce().
-     *
+     * The function returns the partial signature psig for the given key, secnonce and session
+     * values. The secnonce is the one that Musig2GenerateNonce() stored under the given id, for
+     * the same key; it is erased from the card before the signature is computed, whatever the
+     * outcome. The session values b and e*a are computed by the host: the card does not know
+     * the message, the aggregate key or the other signers.
      *
      * ins: 0x7F
      * p1: key number or 0xFF for the last derived Bip32 extended key
-     * p2: Init-Finalize
+     * p2: OP_FINALIZE (0x03). Anything else is rejected with SW_INCORRECT_P2: up to protocol
+     *     0.19 OP_INIT sent the encrypted secnonce back to the card.
      *
-     * data (init): [encrypted secnonce(112b) | iv(16b) | mac(16b)]
-     * data (finalize): [b(32b) | e*a(32b) | has_even_y(R) (1b) | g*gacc (1b) | (option)2FA-flag(2b) | (option)2FA-hmac(20b)]
+     * data: [id(2b) | b(32b) | e*a(32b) | has_even_y(R) (1b) | g*gacc (1b) | (option)2FA-flag(2b) | (option)2FA-hmac(20b)]
+     *   b: less than n; e*a: 1..n-1 (SW_INVALID_PARAMETER otherwise)
      *   has_even_y(R): 0x00 if R has an even y, 0x01 if odd; g*gacc: 0x01 if 1, 0x00 if -1 (other values are rejected)
      *   2FA-hmac: over [ sha256(b | e*a | has_even_y(R) | g*gacc) | 32-byte 0xEE-padding ]
      *
-     * return (init): []
-     * return (finalize): [psig(32b)]
+     * return: [psig(32b)]
      */
     private short Musig2SignHash(APDU apdu, byte[] buffer) {
 
@@ -3868,41 +3882,33 @@ public class Satochip extends javacard.framework.Applet {
         // check that feature is enabled
         if (feature_musig2_policy != FEATURE_ENABLED)
             ISOException.throwIt(SW_FEATURE_DISABLED);
-        
+
+        if (buffer[ISO7816.OFFSET_P2] != OP_FINALIZE)
+            ISOException.throwIt(SW_INCORRECT_P2);
+
         // get data from incoming apdu
         short bytesLeft = Util.makeShort((byte) 0x00, buffer[ISO7816.OFFSET_LC]);
-
-        byte p2 = buffer[ISO7816.OFFSET_P2];
-        if (p2 == OP_INIT){
-
-            if (bytesLeft<144){
-                ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
-            }
-
-            // copy secnonce to recvBuffer for later processing
-            Util.arrayCopyNonAtomic(buffer, ISO7816.OFFSET_CDATA, recvBuffer, OFFSET_BIP327_K1, (short)144);
-            // we will validate secnonce in OP_FINALIZE to ensure integrity
-
-            return (short)0;
-        }
-
-        // at this point p2 != OP_INIT, we perform the bulk of signature processing
-        if (bytesLeft<66){
+        if (bytesLeft<MUSIG2_SIGN_DATA_SIZE){
             ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
         }
         // the flags must be 0x00 or 0x01, so that each signing context has a single encoding
-        // (and a single 2FA hash). Checked before the secnonce is validated, like 2FA below.
+        // (and a single 2FA hash). Like all the checks of the input, before the secnonce is taken.
         if (((buffer[OFFSET_BIP327_SIGN_R_EVENNESS] | buffer[OFFSET_BIP327_SIGN_GGAC]) & (byte)0xFE) != 0)
+            ISOException.throwIt(SW_INVALID_PARAMETER);
+        // b and e*a are scalars: b < n, 0 < e*a < n (public values, no need for constant time)
+        if (!Biginteger.lessThan(buffer, OFFSET_BIP327_SIGN_B, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32)
+                || !Biginteger.lessThan(buffer, OFFSET_BIP327_SIGN_EA, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32)
+                || Biginteger.equalZero(buffer, OFFSET_BIP327_SIGN_EA, (short)32))
             ISOException.throwIt(SW_INVALID_PARAMETER);
 
         // check 2FA if required
-        // done before secnonce validation, so that a failed 2FA attempt does not invalidate the secnonce id
+        // done before the secnonce is taken, so that a failed 2FA attempt does not consume it
         if(needs_2FA){
             // check data length
-            if (bytesLeft<(short)(66+2+20))
+            if (bytesLeft<(short)(MUSIG2_SIGN_DATA_SIZE+2+20))
                 ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
             // check flag for 2fa_hmac_chalresp
-            short hmac_flags= Util.getShort(buffer, (short)(ISO7816.OFFSET_CDATA+66));
+            short hmac_flags= Util.getShort(buffer, (short)(ISO7816.OFFSET_CDATA+MUSIG2_SIGN_DATA_SIZE));
             if (hmac_flags!=HMAC_CHALRESP_2FA)
                 ISOException.throwIt(SW_INCORRECT_ALG);
             // hmac of 64-bytes msg: ( 32bytes sha256(b | e*a | has_even_y(R) | g*gacc) | 32bytes 0xEE-padding)
@@ -3910,108 +3916,153 @@ public class Satochip extends javacard.framework.Applet {
             // nonces and message, e*a carries the challenge e = H(R|Q|m), and the flags set the signs.
             // Approving b alone would let a compromised host pair it with the e*a of another message.
             // The 2FA app must recompute these values from the session context (aggnonce, pubkeys,
-            // tweaks, message), never take them from the host.
-            // the message is staged after the 144-byte encrypted secnonce in recvBuffer, to keep it intact
+            // tweaks, message), never take them from the host. The id of the secnonce is not covered.
             // reset first: importEncryptedSecret() can throw between its update() and doFinal()
             sha256.reset();
-            sha256.doFinal(buffer, ISO7816.OFFSET_CDATA, (short)66, recvBuffer, (short)144);
-            Util.arrayFillNonAtomic(recvBuffer, (short)(144+32), (short)32, (byte)0xEE); // 0xEE for MuSig2 partial sig
-            HmacSha160.computeHmacSha160(data2FA, OFFSET_2FA_HMACKEY, (short)20, recvBuffer, (short)144, (short)64, recvBuffer, (short)(144+64));
-            if (!arrayCompareConstantTime(buffer, (short)(ISO7816.OFFSET_CDATA+66+2), recvBuffer, (short)(144+64), (short)20))
+            sha256.doFinal(buffer, OFFSET_BIP327_SIGN_B, (short)66, recvBuffer, (short)0);
+            Util.arrayFillNonAtomic(recvBuffer, (short)32, (short)32, (byte)0xEE); // 0xEE for MuSig2 partial sig
+            HmacSha160.computeHmacSha160(data2FA, OFFSET_2FA_HMACKEY, (short)20, recvBuffer, (short)0, (short)64, recvBuffer, (short)64);
+            if (!arrayCompareConstantTime(buffer, (short)(ISO7816.OFFSET_CDATA+MUSIG2_SIGN_DATA_SIZE+2), recvBuffer, (short)64, (short)20))
                 ISOException.throwIt(SW_SIGNATURE_INVALID);
         }
 
-        // validate integrity then decrypt secnonce stored in recvBuffer during OP_INIT step
-        // compute MAC over encrypted secnonce+IV
-        // check MAC then return encrypted nonce
-        sigAESMAC.init(bip327_mackey, Signature.MODE_VERIFY);
-        boolean isOk = sigAESMAC.verify(recvBuffer, OFFSET_BIP327_K1, (short) 128, recvBuffer, OFFSET_BIP327_MAC, (short)16);
-        if (!isOk)
-            ISOException.throwIt(SW_BIP327_WRONG_SECNONCE);
+        // P1 defines which privkey is used
+        ECPrivateKey privkey = getSigningKey(buffer[ISO7816.OFFSET_P1]);
 
-        // from here on, the scratch buffers hold secrets (decrypted secnonce, sk, partial sums):
-        // they are erased in the finally block below, also on error. Before this point, the
-        // encrypted secnonce is kept in recvBuffer, so that OP_FINALIZE can be retried (e.g. after
-        // a failed 2FA attempt). buffer[0..32) is kept on success (the partial signature).
+        return musig2Sign(buffer, privkey);
+    }
+
+    /**
+     * BIP327 Sign for the key privkey, with the session values given by the host at
+     * buffer[OFFSET_BIP327_SIGN_*] and the secnonce of the slot with the given id:
+     *   psig = (k1 + b*k2 + (e*a)*d) mod n,  k_i negated if R has an odd y, d = +-sk
+     * The caller has done the access control (PIN, policy, 2FA) and checked the input.
+     * Writes psig (32 bytes) at buffer[0].
+     *
+     * The secnonce is taken out of its slot and the slot erased before anything else: from
+     * then on this secnonce exists in RAM only, and is gone when the command ends.
+     *
+     * The partial signature is verified before it is returned, as BIP327 recommends
+     * (PartialSigVerify: psig*G = Re + e*a*g*P, with Re = +-(R1 + b*R2)). The card has no
+     * addition of two arbitrary points, so the right-hand side is rearranged:
+     *   psig*G - (e*a)*d*G  =  (k1 + b*k2)*G          (signs as above)
+     *   - left:  only public values. (e*a)*d*G is a key agreement on P = sk*G, computed again
+     *            by the key object, and the sum with psig*G is the ALG_EC_PACE_GM key agreement;
+     *   - right: u = k1 + b*k2 is computed twice, from the two copies of the secnonce, and
+     *            u*G is computed as for R (ecdsaComputeRPoint(), which compares the two u).
+     * A partial signature whose e*a*d term or whose sum is wrong does not verify: 0x9C4D, no
+     * output. A secnonce cannot be used twice, so no pair (correct, faulty) of partial
+     * signatures for the same nonces can be collected; the verification keeps a wrong partial
+     * signature from spoiling a session and from leaving the card at all.
+     *
+     * Multiplications: mulModOrder(), i.e. the backend selected at install. With the bytecode
+     * backend d is split into two random shares (it is multiplied by e*a, which the host
+     * knows, at every signature); k2 is used for this one signature only and is multiplied by b
+     * as it is.
+     *
+     * @return 32
+     */
+    private short musig2Sign(byte[] buffer, ECPrivateKey privkey) {
+        if ((short)buffer.length < ECDSA_APDU_SIZE)
+            ISOException.throwIt(SW_INTERNAL_ERROR);
+
         short sizeout = (short)0;
         try {
-            // decrypt [ k1 | k2 | pk | id | padding ] using a key only known to the applet
-            // we reuse the cipher object of the secure channel, since it is used in a stateless way.
-            sc_aes128_cbc.init(bip327_encryptkey, Cipher.MODE_DECRYPT, recvBuffer, OFFSET_BIP327_IV, AES_IV_SIZE);
-            sc_aes128_cbc.doFinal(recvBuffer, OFFSET_BIP327_K1, (short)112, recvBuffer, OFFSET_BIP327_K1);
-
-            // check that the secnonce id is in list of valid ids (not used yet)
-            short id = Util.getShort(recvBuffer, OFFSET_BIP327_ID);
-            isOk = false;
-            for (short i=0; i<BIP327_MAX_NB_ID; i++){
-                if (bip327_valid_ids[i] == id) {
-                    // invalidate id so it cannot be reused in the future
-                    bip327_valid_ids[i] = 0x0000;
-                    isOk = true;
-                    break;
-                }
-            }
-            if (!isOk)
-                ISOException.throwIt(SW_BIP327_INVALID_ID);
-
-            // append decrypted secnonce to buffer
-            Util.arrayCopyNonAtomic(recvBuffer, OFFSET_BIP327_K1, buffer, OFFSET_BIP327_SIGN_K1_, (short)97);
-            // at this point, buffer = [cla, ins, p1, p2, lc] + [b(32b) | ea(32b) | r_has_even_y(1b) | ggacc_is_1(1b) | k1(32b) | k2(32b) | pk(33b)]
-
-            // P1 defines which privkey is used
-            ECPrivateKey privkey = getSigningKey(buffer[ISO7816.OFFSET_P1]);
-
-            // compute pubkey pk from sk
-            getPublicKey(privkey, recvBuffer, (short)0); // uncompressed pubkey (65b)
-            setCompressionByte(recvBuffer, (short)0);
-
-            // check pubkey from secnonce match pubkey derived from sk
-            if (0 != Util.arrayCompare(buffer, OFFSET_BIP327_SIGN_PK, recvBuffer, (short)0, (short)33)) {
-                ISOException.throwIt(SW_BIP327_PUBKEY_MISMATCH); // buffers are erased in the finally block
-            }
-            // we don't need pk from recvBuffer anymore
-
+            // the session values, out of the APDU buffer
+            short id = Util.getShort(buffer, OFFSET_BIP327_SIGN_ID);
+            Util.arrayCopyNonAtomic(buffer, OFFSET_BIP327_SIGN_B, recvBuffer, MUSIG2_OFFSET_B, (short)64);
             // k1, k2 = k1_, k2_ if has_even_y(R), else n-k1_, n-k2_
             boolean r_has_odd_y = (buffer[OFFSET_BIP327_SIGN_R_EVENNESS] == 0x01); // 0x00 if even, 0x01 if odd
             // d = g*gacc*d' mod n: the private key is negated if g*gacc = -1 (0x00), kept if 1 (0x01)
             boolean negate_sk = (buffer[OFFSET_BIP327_SIGN_GGAC] == 0x00);
 
-            // psig = (k1 + b*k2 + (e*a)*d) mod n, computed twice with independent blinding (see
-            // blindScalar()). Both rounds derive d, k1 and k2 again from the key object and the
-            // secnonce, so that a fault injected in either computation is detected by comparing
-            // the results. recvBuffer = [ sk | d | k1 | k2 | psig of round 0 | accumulator(96b) ]
-            final short OFFSET_SK = (short)0;
-            final short OFFSET_D = (short)32;
-            final short OFFSET_K1 = (short)64;
-            final short OFFSET_K2 = (short)96;
-            final short OFFSET_PSIG = (short)128;
-            final short OFFSET_ACC = (short)160;
-            for (short round = (short)0; round < (short)2; round++){
-                privkey.getS(recvBuffer, OFFSET_SK);
-                copyScalar(negate_sk, recvBuffer, OFFSET_SK, recvBuffer, OFFSET_D);
-                copyScalar(r_has_odd_y, buffer, OFFSET_BIP327_SIGN_K1_, recvBuffer, OFFSET_K1);
-                copyScalar(r_has_odd_y, buffer, OFFSET_BIP327_SIGN_K2_, recvBuffer, OFFSET_K2);
-                Util.arrayFillNonAtomic(recvBuffer, OFFSET_ACC, BIGNUM_SIZE, (byte)0);
-                blindedAdd(recvBuffer, OFFSET_ACC, recvBuffer, OFFSET_K1);
-                blindedMulAdd(recvBuffer, OFFSET_ACC, buffer, OFFSET_BIP327_SIGN_EA, recvBuffer, OFFSET_D);
-                blindedMulAdd(recvBuffer, OFFSET_ACC, buffer, OFFSET_BIP327_SIGN_B, recvBuffer, OFFSET_K2);
-                Biginteger.mod(recvBuffer, OFFSET_ACC, BIGNUM_SIZE, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32);
-                if (round == (short)0){
-                    Util.arrayCopyNonAtomic(recvBuffer, (short)(OFFSET_ACC+BIGNUM_SIZE-32), recvBuffer, OFFSET_PSIG, (short)32);
-                }
-            }
-            if (!arrayCompareConstantTime(recvBuffer, (short)(OFFSET_ACC+BIGNUM_SIZE-32), recvBuffer, OFFSET_PSIG, (short)32))
-                ISOException.throwIt(SW_INTERNAL_ERROR);
+            // take the secnonce out of its slot, and erase the slot before anything is computed
+            short slotOff = (short)((id & (MUSIG2_NB_SLOTS-1)) * MUSIG2_SLOT_SIZE);
+            if (id == (short)0 || Util.getShort(musig2Slots, slotOff) != id)
+                ISOException.throwIt(SW_BIP327_INVALID_ID);
+            Util.arrayCopyNonAtomic(musig2Slots, (short)(slotOff+MUSIG2_SLOT_K), ecdsaRam, MUSIG2_RAM_K, MUSIG2_RAM_K_SIZE);
+            Util.arrayCopyNonAtomic(musig2Slots, (short)(slotOff+MUSIG2_SLOT_PK), ecdsaRam, ECDSA_RAM_H2, (short)33);
+            Util.setShort(musig2Slots, slotOff, (short)0);
+            Util.arrayFillNonAtomic(musig2Slots, (short)(slotOff+MUSIG2_SLOT_PK), (short)(MUSIG2_SLOT_SIZE-MUSIG2_SLOT_PK), (byte)0);
 
-            // copy to output buffer (overwrites b, which is not needed anymore)
-            Util.arrayCopyNonAtomic(recvBuffer, OFFSET_PSIG, buffer, (short)0, (short)32);
+            // the secnonce belongs to one key: check that it is this one
+            getPublicKey(privkey, recvBuffer, ECDSA_OFFSET_ACC); // uncompressed pubkey (65b)
+            setCompressionByte(recvBuffer, ECDSA_OFFSET_ACC);
+            if (0 != Util.arrayCompare(ecdsaRam, ECDSA_RAM_H2, recvBuffer, ECDSA_OFFSET_ACC, (short)33)) {
+                ISOException.throwIt(SW_BIP327_PUBKEY_MISMATCH); // buffers are erased in the finally block
+            }
+
+            // u = +-(k1 + b*k2) mod n, twice: from the first copies to recvBuffer[K], from the
+            // second ones to ecdsaRam[K2]. -(k1) + b*(-k2) = -(k1 + b*k2): negated once, at the end.
+            mulModOrder(recvBuffer, MUSIG2_OFFSET_B, ecdsaRam, (short)(MUSIG2_RAM_K+64));
+            Biginteger.addModCT(recvBuffer, ECDSA_OFFSET_PRODUCT, ecdsaRam, MUSIG2_RAM_K,
+                    Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32, recvBuffer, ECDSA_OFFSET_ACC);
+            copyScalar(r_has_odd_y, recvBuffer, ECDSA_OFFSET_PRODUCT, recvBuffer, ECDSA_OFFSET_K);
+            mulModOrder(recvBuffer, MUSIG2_OFFSET_B, ecdsaRam, (short)(MUSIG2_RAM_K+96));
+            Biginteger.addModCT(recvBuffer, ECDSA_OFFSET_PRODUCT, ecdsaRam, (short)(MUSIG2_RAM_K+32),
+                    Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32, recvBuffer, ECDSA_OFFSET_ACC);
+            copyScalar(r_has_odd_y, recvBuffer, ECDSA_OFFSET_PRODUCT, ecdsaRam, ECDSA_RAM_K2);
+            // the nonces themselves are not needed anymore
+            Util.arrayFillNonAtomic(ecdsaRam, MUSIG2_RAM_K, MUSIG2_RAM_K_SIZE, (byte)0);
+
+            // d = +-sk
+            privkey.getS(recvBuffer, ECDSA_OFFSET_ACC);
+            copyScalar(negate_sk, recvBuffer, ECDSA_OFFSET_ACC, recvBuffer, MUSIG2_OFFSET_D);
+            Util.arrayFillNonAtomic(recvBuffer, ECDSA_OFFSET_ACC, (short)32, (byte)0);
+
+            // psig = u + (e*a)*d mod n, accumulated in ecdsaRam[V], from the first u
+            Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_K, ecdsaRam, ECDSA_RAM_V, (short)32);
+            if (mulBytecode) {
+                // d = d1 + d2 mod n with d1 fresh and uniformly random: see signSchnorr()
+                randomScalar(recvBuffer, ECDSA_OFFSET_X);                                         // d1
+                copyScalar(true, recvBuffer, ECDSA_OFFSET_X, ecdsaRam, ECDSA_RAM_T);              // n - d1
+                Biginteger.addModCT(recvBuffer, MUSIG2_OFFSET_D, ecdsaRam, ECDSA_RAM_T,          // d2 = d - d1
+                        Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32, recvBuffer, ECDSA_OFFSET_ACC);
+                mulModOrder(recvBuffer, MUSIG2_OFFSET_EA, recvBuffer, ECDSA_OFFSET_X);            // (e*a)*d1
+                Biginteger.addModCT(ecdsaRam, ECDSA_RAM_V, recvBuffer, ECDSA_OFFSET_PRODUCT,
+                        Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32, recvBuffer, ECDSA_OFFSET_ACC);
+            }
+            mulModOrder(recvBuffer, MUSIG2_OFFSET_EA, recvBuffer, MUSIG2_OFFSET_D);               // (e*a)*d, or (e*a)*d2
+            Biginteger.addModCT(ecdsaRam, ECDSA_RAM_V, recvBuffer, ECDSA_OFFSET_PRODUCT,
+                    Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32, recvBuffer, ECDSA_OFFSET_ACC);
+            // psig, twice: H2 is the output, V goes into the verification
+            Util.arrayCopyNonAtomic(ecdsaRam, ECDSA_RAM_V, ecdsaRam, ECDSA_RAM_H2, (short)32);
+            Util.arrayFillNonAtomic(recvBuffer, MUSIG2_OFFSET_D, (short)32, (byte)0);
+            Util.arrayFillNonAtomic(recvBuffer, ECDSA_OFFSET_ACC, BIGNUM_SIZE, (byte)0);
+
+            // right-hand side: U = u*G at buffer[ECDSA_APDU_R], with the two u compared
+            ecdsaComputeRPoint(buffer);
+            Util.arrayFillNonAtomic(recvBuffer, ECDSA_OFFSET_K, (short)64, (byte)0);
+            Util.arrayFillNonAtomic(ecdsaRam, ECDSA_RAM_K2, (short)32, (byte)0);
+
+            // left-hand side: T = psig*G - (e*a)*d*G. d*G = P if d = sk, -P if d = n-sk: the
+            // scalar on P is n - e*a in the first case, e*a in the second.
+            boolean valid = false;
+            try {
+                getPublicKey(privkey, recvBuffer, ECDSA_OFFSET_ACC); // P, uncompressed (65b)
+                copyScalar(!negate_sk, recvBuffer, MUSIG2_OFFSET_EA, ecdsaRam, ECDSA_RAM_T);
+                setEphemeralScalar(ecdsaRam, ECDSA_RAM_T);
+                keyAgreement.init(ephemeral_privkey);
+                keyAgreement.generateSecret(recvBuffer, ECDSA_OFFSET_ACC, (short)65, recvBuffer, MUSIG2_OFFSET_D);
+                setEphemeralScalar(ecdsaRam, ECDSA_RAM_V);
+                keyAgreementAdd.init(ephemeral_privkey);
+                keyAgreementAdd.generateSecret(recvBuffer, MUSIG2_OFFSET_D, (short)65, recvBuffer, ECDSA_OFFSET_ACC);
+                valid = (Util.arrayCompare(recvBuffer, ECDSA_OFFSET_ACC, buffer, ECDSA_APDU_R, (short)65) == (byte)0);
+            } catch (CryptoException e) {
+                // e.g. psig = 0, or the sum is the point at infinity
+                valid = false;
+            }
+            if (!valid)
+                ISOException.throwIt(SW_ECDSA_VERIFY_FAILED);
+            // the copy that was verified and the one that is output are the same
+            if (!arrayCompareConstantTime(ecdsaRam, ECDSA_RAM_H2, ecdsaRam, ECDSA_RAM_V, (short)32))
+                ISOException.throwIt(SW_ECDSA_VERIFY_FAILED);
+
+            Util.arrayCopyNonAtomic(ecdsaRam, ECDSA_RAM_H2, buffer, (short)0, (short)32);
             sizeout = (short)32;
         } finally {
-            // buffer[0..168) held k1, k2 and pk (see OFFSET_BIP327_SIGN_*)
-            clearSigningScratch(buffer, sizeout, (short)(OFFSET_BIP327_SIGN_PK+33));
+            clearSigningScratch(buffer, sizeout, ECDSA_APDU_SIZE);
         }
-
-        // todo: sign with authentikey?
         return sizeout;
     }
 

@@ -8,6 +8,29 @@ Satochip applet full versions follows this format: vX.Y-Z.W where:
 * X.Y refers to the PROTOCOL VERSION: changes that impact compatibility with the client side (e.g new functionalities, major patch...)
 * Z.W refers to changes with no impact on compatibility of the client (e.g minor patches, optimizations...)
 
+## [0.20-0.1]
+
+MuSig2 (BIP327) is rebuilt like the ECDSA and Schnorr signatures of 0.17 and 0.19. The protocol version becomes 0.20 because both MuSig2 commands change: the secret nonce no longer leaves the card.
+
+### Changes for clients
+
+* **Musig2GenerateNonce (0x7E)** is a single command (P2 = 0x01): it returns `[pubnonce(66) | id(2)]`. The second step (P2 = 0x03), which returned the 144-byte encrypted secnonce, is gone (`SW_INCORRECT_P2`).
+* **Musig2SignHash (0x7F)** is a single command (P2 = 0x03): `[id(2) | b(32) | e*a(32) | has_even_y(R)(1) | g*gacc(1) | optional 2FA fields]`. The first step (P2 = 0x01), which sent the encrypted secnonce back, is gone (`SW_INCORRECT_P2`). b must be below the group order and e\*a in 1..n-1 (`SW_INVALID_PARAMETER`). The 2FA approval is computed as before, over `b | e*a | flags`.
+* The card keeps **at most 8 pending secnonces**. Generating a ninth discards the oldest: its id is then refused with `0x9C47`. A secnonce is consumed by the first Musig2SignHash that passes the input and 2FA checks, whatever its outcome.
+* New status word for Musig2SignHash: `0x9C4D`, the partial signature did not verify on the card (nothing is output). `0x9C44` and `0x9C46` are no longer used.
+
+### New features
+
+* **The MuSig2 secret nonce stays in the card.** It used to be encrypted with the platform's AES and handed to the host, which sent it back for signing, so the platform's AES engine saw both nonces in clear (the nonces and one partial signature give the private key). It is now stored in the card's memory under an id, and erased before it is used.
+  * a used secnonce does not exist anymore. Before, the card only remembered which ids were still valid: one bit flipped in that list made a used secnonce valid again, and two partial signatures for the same secnonce with the same b and two different e\*a give the private key;
+  * a pending secnonce survives power-off (it is in persistent memory), so the two commands can be sent in different sessions; resetting the seed erases all of them.
+* **Nonce derivation (BIP327 NonceGen).** The 32 random bytes still come from the platform's generator, and the card now appends its own 8-byte counter to extra_in (persistent, incremented before each use, never reset): the nonces do not repeat if either one does not. k1 and k2 are hashed on the SHA-256 backend selected at install, each twice, and compared. A nonce equal to 0 or not below n is refused.
+* **R1 = k1\*G and R2 = k2\*G** are computed as (k\*w^-1)\*(w\*G) for a random w: the platform's point multiplication no longer receives the nonces.
+* **The partial signature is verified on the card** before it is returned, as BIP327 recommends: psig\*G - (e\*a)\*d\*G must equal (k1 + b\*k2)\*G, where the left side is computed from public values and the public key computed again by the key object, and the right side from the second copy of the secnonce. This replaces the second computation of the partial signature.
+* **Multiplication backend**: the multiplications of the partial signature follow the choice made at install (RSA squaring engine or bytecode). In bytecode the private key is split into two random shares, as for Schnorr.
+* What does not change: **the card signs blind.** b and e\*a are computed by the host; the card does not know the message, the aggregate key or the other signers. The 2FA application is what checks them.
+* Installation needs 128 more bytes of RAM (the working buffer of the signatures grows from 192 to 320 bytes) and about 1.3 KB of persistent memory for the secnonce slots.
+
 ## [0.19-0.1]
 
 SignSchnorrHash is rebuilt like the self-built ECDSA of 0.17, and the multiplications on secret values can be done in bytecode. The protocol version becomes 0.19 because SignSchnorrHash takes a new parameter and GetStatus returns two more bytes. (0.18 is the number used by the anti-exfil branch, which is not part of this version.)

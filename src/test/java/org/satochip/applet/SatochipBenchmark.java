@@ -93,13 +93,11 @@ public class SatochipBenchmark {
     byte[] ea = bytes32(new BigInteger(1, sha256("musig2 ea".getBytes())).mod(n));
     byte[] finalizeData = concat(b, ea, new byte[]{0x00, 0x01});
     for (int i = -warmup; i < iterations; i++) {
-      time("musig2_nonce_init", i, () -> cmdSet.sendRawSecure(INS_MUSIG2_GENERATE_NONCE, 0xFF, OP_INIT,
+      byte[] nonce = time("musig2_nonce", i, () -> cmdSet.sendRawSecure(INS_MUSIG2_GENERATE_NONCE, 0xFF, OP_INIT,
           new byte[]{0x00, (byte) 0xFF, 0x00}));
-      byte[] secnonce = time("musig2_nonce_final", i,
-          () -> cmdSet.sendRawSecure(INS_MUSIG2_GENERATE_NONCE, 0xFF, OP_FINALIZE, new byte[0]));
-      time("musig2_sign_init", i, () -> cmdSet.sendRawSecure(INS_MUSIG2_SIGN_HASH, 0xFF, OP_INIT, secnonce));
-      byte[] psig = time("musig2_sign_final", i,
-          () -> cmdSet.sendRawSecure(INS_MUSIG2_SIGN_HASH, 0xFF, OP_FINALIZE, finalizeData));
+      byte[] id = java.util.Arrays.copyOfRange(nonce, 66, 68);
+      byte[] psig = time("musig2_sign", i,
+          () -> cmdSet.sendRawSecure(INS_MUSIG2_SIGN_HASH, 0xFF, OP_FINALIZE, concat(id, finalizeData)));
       assertEquals(32, psig.length, "a MuSig2 partial signature is 32 bytes");
     }
 

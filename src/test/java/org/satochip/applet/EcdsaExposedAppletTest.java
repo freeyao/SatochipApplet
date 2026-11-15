@@ -10,6 +10,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.satochip.desktop.PCSCCardChannel;
 import org.satochip.io.APDUResponse;
+import org.bouncycastle.util.encoders.Hex;
 import pro.javacard.engine.JavaCardEngine;
 
 import java.lang.reflect.Field;
@@ -254,6 +255,98 @@ public class EcdsaExposedAppletTest {
       Arrays.fill(ecdsaRam, (byte) 0);
       Arrays.fill(tmpBuffer, (byte) 0);
     }
+  }
+
+  // ---- MuSig2 ---------------------------------------------------------------------------------
+
+  /**
+   * The NonceGen vectors of BIP327 (nonce_gen_vectors.json) that the card's input format can
+   * express (a private key is given, the message is at most 32 bytes):
+   * {rand_, sk, aggpk, msg, extra_in, expected_secnonce (k1 | k2 | pk), expected_pubnonce}.
+   */
+  static final String[][] BIP327_NONCE_GEN_VECTORS = {
+      {"0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F",
+       "0202020202020202020202020202020202020202020202020202020202020202",
+       "0707070707070707070707070707070707070707070707070707070707070707",
+       "0101010101010101010101010101010101010101010101010101010101010101",
+       "0808080808080808080808080808080808080808080808080808080808080808",
+       "B114E502BEAA4E301DD08A50264172C84E41650E6CB726B410C0694D59EFFB6495B5CAF28D045B973D63E3C99A44B807BDE375FD6CB39E46DC4A511708D0E9D2024D4B6CD1361032CA9BD2AEB9D900AA4D45D9EAD80AC9423374C451A7254D0766",
+       "02F7BE7089E8376EB355272368766B17E88E7DB72047D05E56AA881EA52B3B35DF02C29C8046FDD0DED4C7E55869137200FBDBFE2EB654267B6D7013602CAED3115A"},
+      {"0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F0F",
+       "0202020202020202020202020202020202020202020202020202020202020202",
+       "0707070707070707070707070707070707070707070707070707070707070707",
+       "",
+       "0808080808080808080808080808080808080808080808080808080808080808",
+       "E862B068500320088138468D47E0E6F147E01B6024244AE45EAC40ACE5929B9F0789E051170B9E705D0B9EB49049A323BBBBB206D8E05C19F46C6228742AA7A9024D4B6CD1361032CA9BD2AEB9D900AA4D45D9EAD80AC9423374C451A7254D0766",
+       "023034FA5E2679F01EE66E12225882A7A48CC66719B1B9D3B6C4DBD743EFEDA2C503F3FD6F01EB3A8E9CB315D73F1F3D287CAFBB44AB321153C6287F407600205109"}
+  };
+
+  @Test
+  @DisplayName("BIP327 NonceGen vectors are reproduced, and MuSig2 partial signatures verify, on the bytecode backends")
+  void musig2NonceGenVectorsTest() throws Exception {
+    byte[] aid = SatochipTest.SATOCHIP_INSTANCE_AID;
+    Satochip applet = (Satochip) engine.getApplet(new AID(aid, (short) 0, (byte) aid.length));
+    Method nonceGen = Satochip.class.getDeclaredMethod("musig2NonceGen", byte[].class,
+        javacard.security.ECPrivateKey.class, boolean.class);
+    nonceGen.setAccessible(true);
+    Method getSigningKey = Satochip.class.getDeclaredMethod("getSigningKey", byte.class);
+    getSigningKey.setAccessible(true);
+    byte[] recvBuffer = (byte[]) field(applet, "recvBuffer");
+    byte[] slots = (byte[]) field(applet, "musig2Slots");
+    int slotSize = constant("MUSIG2_SLOT_SIZE");
+    int randOff = constant("OFFSET_BIP327_RAND");
+
+    try {
+      for (String[] v : BIP327_NONCE_GEN_VECTORS) {
+        // the command draws rand' from the card and appends its counter to extra_in: the vectors
+        // fix both, so the derivation is called directly, with the key of a slot
+        assertEquals(SatochipTest.SW_OK, SatochipTest.importSlotKey(cmd, SLOT, Hex.decode(v[1])));
+        Object key = getSigningKey.invoke(applet, (byte) SLOT);
+        byte[] aggpk = Hex.decode(v[2]), msg = Hex.decode(v[3]), extra = Hex.decode(v[4]);
+        byte[] data = SatochipTest.concat(new byte[]{(byte) aggpk.length}, aggpk, new byte[]{(byte) msg.length}, msg,
+            new byte[]{(byte) extra.length}, extra);
+        byte[] apdu = new byte[261];
+        apdu[4] = (byte) data.length;
+        System.arraycopy(data, 0, apdu, 5, data.length);
+        System.arraycopy(Hex.decode(v[0]), 0, recvBuffer, randOff, 32);
+
+        assertEquals((short) 68, nonceGen.invoke(applet, apdu, key, false));
+        assertEquals(v[6], Hex.toHexString(apdu, 0, 66).toUpperCase(), "pubnonce");
+        int id = ((apdu[66] & 0xff) << 8) | (apdu[67] & 0xff);
+        int slot = (id & (constant("MUSIG2_NB_SLOTS") - 1)) * slotSize;
+        // slot = [id | pk | k1 | k1 | k2 | k2]
+        String secnonce = Hex.toHexString(slots, slot + 35, 32) + Hex.toHexString(slots, slot + 99, 32)
+            + Hex.toHexString(slots, slot + 2, 33);
+        assertEquals(v[5], secnonce.toUpperCase(), "secnonce");
+        assertArrayEquals(Arrays.copyOfRange(slots, slot + 35, slot + 67), Arrays.copyOfRange(slots, slot + 67, slot + 99), "k1, twice");
+        assertArrayEquals(Arrays.copyOfRange(slots, slot + 99, slot + 131), Arrays.copyOfRange(slots, slot + 131, slot + 163), "k2, twice");
+        // nothing of the derivation is left in the working buffers
+        assertArrayEquals(new byte[recvBuffer.length], recvBuffer, "recvBuffer erased");
+        assertArrayEquals(new byte[((byte[]) field(applet, "ecdsaRam")).length], (byte[]) field(applet, "ecdsaRam"), "ecdsaRam erased");
+      }
+    } finally {
+      cmd.sendRawSecure(SatochipTest.INS_RESET_KEY, SLOT, 0x00, new byte[0]);
+    }
+
+    // a secnonce whose two copies differ (one bit flipped in the card's memory) gives no
+    // partial signature: the verification compares the two
+    assertEquals(SatochipTest.SW_OK, cmd.cardBip32ImportSeed(Vectors.BIP32_SEED).getSw());
+    cmd.cardBip32GetExtendedKeyRaw("m/86'/0'/0'/0/3");
+    byte[] ctx = SatochipTest.concat(SatochipTest.sha256("b".getBytes()), SatochipTest.sha256("ea".getBytes()), new byte[]{0x00, 0x01});
+    for (int offset : new int[]{35 + 31, 67 + 0, 99 + 5, 131 + 31}) {
+      APDUResponse init = cmd.sendRawSecure(SatochipTest.INS_MUSIG2_GENERATE_NONCE, 0xFF, SatochipTest.OP_INIT,
+          new byte[]{0x00, (byte) 0xFF, 0x00});
+      assertEquals(SatochipTest.SW_OK, init.getSw());
+      byte[] id = Arrays.copyOfRange(init.getData(), 66, 68);
+      int slot = (id[1] & (constant("MUSIG2_NB_SLOTS") - 1)) * slotSize;
+      slots[slot + offset] ^= 0x04;
+      assertEquals(SW_ECDSA_VERIFY_FAILED, cmd.sendRawSecure(SatochipTest.INS_MUSIG2_SIGN_HASH, 0xFF,
+          SatochipTest.OP_FINALIZE, SatochipTest.concat(id, ctx)).getSw(), "slot byte " + offset + " altered");
+      assertArrayEquals(new byte[slotSize], Arrays.copyOfRange(slots, slot, slot + slotSize), "the slot is erased all the same");
+    }
+
+    // and through the commands, on these backends
+    SatochipTest.checkMusig2PartialSignatures(cmd);
   }
 
   private static Object field(Satochip applet, String name) throws Exception {
