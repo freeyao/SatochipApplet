@@ -1784,14 +1784,22 @@ public class SatochipTest {
   @DisplayName("BIP340: signatures match a reference signer, with and without host-supplied aux data")
   @FeaturePolicies({"schnorr", "rsaMult"})
   void bip340ReferenceTest() {
+    checkBip340Reference(cmdSet, BIP340_SLOT, 6);
+  }
+
+  /**
+   * Imports keys into the slot, tweaks them (BIP86) and compares the card's signatures with
+   * {@link #signBip340}, with host-supplied aux data and without. Leaves the slot empty.
+   */
+  static void checkBip340Reference(TestSatochipCommandSet cmdSet, int slot, int keys) {
     // Goes through the taproot tweak, so it needs no Nostr policy: the tweaked key is recomputed
     // here from the imported key. Both parities of P and of R come up over the keys and messages.
     try {
-      for (int i = 0; i < 6; i++) {
+      for (int i = 0; i < keys; i++) {
         byte[] seckey = sha256(("bip340 reference key " + i).getBytes());
         byte[] tweaked = bip86TweakedKey(seckey);
-        assertEquals(SW_OK, importSlotKey(cmdSet, BIP340_SLOT, seckey));
-        assertEquals(SW_OK, cmdSet.sendRawSecure(INS_TAPROOT_TWEAK_PRIVKEY, BIP340_SLOT, 0x00,
+        assertEquals(SW_OK, importSlotKey(cmdSet, slot, seckey));
+        assertEquals(SW_OK, cmdSet.sendRawSecure(INS_TAPROOT_TWEAK_PRIVKEY, slot, 0x00,
             new byte[]{0x00}).getSw());
         for (int j = 0; j < 3; j++) {
           byte[] msg = sha256(("bip340 reference message " + i + " " + j).getBytes());
@@ -1809,10 +1817,10 @@ public class SatochipTest {
           assertArrayEquals(signBip340(tweaked, msg, new byte[32]), sig.getData(),
               "no aux, key " + i + " message " + j);
         }
-        assertEquals(SW_OK, cmdSet.sendRawSecure(INS_RESET_KEY, BIP340_SLOT, 0x00, new byte[0]).getSw());
+        assertEquals(SW_OK, cmdSet.sendRawSecure(INS_RESET_KEY, slot, 0x00, new byte[0]).getSw());
       }
     } finally {
-      cmdSet.sendRawSecure(INS_RESET_KEY, BIP340_SLOT, 0x00, new byte[0]);
+      cmdSet.sendRawSecure(INS_RESET_KEY, slot, 0x00, new byte[0]);
     }
   }
 

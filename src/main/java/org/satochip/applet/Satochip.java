@@ -3294,87 +3294,144 @@ public class Satochip extends javacard.framework.Applet {
                 ISOException.throwIt(SW_SIGNATURE_INVALID);
         }
 
-        // from here on, the scratch buffers hold secrets (sk, d, the nonce): they are erased in the
-        // finally block below, also on error. buffer[0..64) is kept on success (the signature).
+        return signSchnorr(buffer, ISO7816.OFFSET_CDATA,
+                (p2 == SCHNORR_AUX_FROM_HOST) ? (short)(ISO7816.OFFSET_CDATA+32) : (short)-1);
+    }
+
+    // signSchnorr() keeps the public key P at buffer[SCHNORR_APDU_P], behind the two points
+    // that the computation of R uses (ECDSA_APDU_Q, ECDSA_APDU_R)
+    private static final short SCHNORR_APDU_P = (short)130;
+    private static final short SCHNORR_APDU_SIZE = (short)195;
+
+    /**
+     * Signs the 32-byte hash at buffer[hashOffset] with the taproot tweaked key, as specified in
+     * BIP340 (default signing), and writes the 64-byte signature bytes(R) || bytes(s) at buffer[0].
+     * The auxiliary random data is the 32 bytes at buffer[auxOffset], or 32 zero bytes if
+     * auxOffset is negative. The caller has done all the access control (PIN, policy, 2FA).
+     *
+     * Uses the scratch layout of the self-built ECDSA (see signEcdsa()): recvBuffer holds m at H,
+     * d at D, t then e at HK, the nonce at K; ecdsaRam holds the second copy of m at H2 and the
+     * second computation of the nonce at K2. buffer[0..195) is used, the hash and the auxiliary
+     * data must lie in buffer[0..130) and are read before anything is written there.
+     *
+     * This version: the nonce hash is computed twice and compared; R is still computed by the
+     * platform from the nonce itself, and s is computed twice and compared.
+     * @return 64
+     */
+    private short signSchnorr(byte[] buffer, short hashOffset, short auxOffset) {
+        if ((short)buffer.length < SCHNORR_APDU_SIZE)
+            ISOException.throwIt(SW_INTERNAL_ERROR);
+
+        // from here on, the scratch buffers hold secrets (d, t, the nonce): they are erased in
+        // the finally block below, also on error. buffer[0..64) is kept on success (the signature).
         short sizeout = (short)0;
         try {
-            // auxiliary random data: from the host, or zero. Not from the platform RNG (see above).
-            if (p2 == SCHNORR_AUX_FROM_HOST)
-                Util.arrayCopyNonAtomic(buffer, (short)(ISO7816.OFFSET_CDATA+32), recvBuffer, OFFSET_BIP340_aux, (short)32);
+            // m, twice, each read on its own: H for the signature, H2 for the second computation
+            // of the nonce
+            Util.arrayCopyNonAtomic(buffer, hashOffset, recvBuffer, ECDSA_OFFSET_H, (short)32);
+            Util.arrayCopyNonAtomic(buffer, hashOffset, ecdsaRam, ECDSA_RAM_H2, (short)32);
+            // auxiliary random data: from the host, or zero. Not from the platform RNG.
+            if (auxOffset >= (short)0)
+                Util.arrayCopyNonAtomic(buffer, auxOffset, recvBuffer, ECDSA_OFFSET_X, (short)32);
             else
-                Util.arrayFillNonAtomic(recvBuffer, OFFSET_BIP340_aux, (short)32, (byte)0);
-        
-            // copy message hash to buffer
-            Util.arrayCopyNonAtomic(buffer, ISO7816.OFFSET_CDATA, recvBuffer, OFFSET_BIP340_m, (short)32);
-            // compute the corresponding partial public key...
-            getPublicKey(taproot_tweakedkey, buffer, (short)31); // uncompressed pubkey (65b)
-            // we leave 32 bytes before coordx for reuse in next steps
+                Util.arrayFillNonAtomic(recvBuffer, ECDSA_OFFSET_X, (short)32, (byte)0);
+
+            // P = sk*G, computed by the key object
+            getPublicKey(taproot_tweakedkey, buffer, SCHNORR_APDU_P); // uncompressed pubkey (65b)
             // d = sk if has_even_y(P), else n-sk
-            boolean p_has_odd_y = ((buffer[(short)(31+64)] & 0x01) != 0);
-            taproot_tweakedkey.getS(recvBuffer, OFFSET_BIP340_sk);
-            copyScalar(p_has_odd_y, recvBuffer, OFFSET_BIP340_sk, recvBuffer, OFFSET_BIP340_d);
-            // t = bytes(d) ^ hashBIP0340/aux(a)
-            schnorr_hash_tag(tags, (short)0, (short)11, recvBuffer, OFFSET_BIP340_aux, (short)32, recvBuffer, OFFSET_BIP340_t);
-            short i;
-            for (i = (short)0; i < (short)32; i++){
-                recvBuffer[(short)(OFFSET_BIP340_t+i)] = (byte) (recvBuffer[(short)(OFFSET_BIP340_t+i)] ^ recvBuffer[(short)(OFFSET_BIP340_d+i)]);
+            boolean p_has_odd_y = ((buffer[(short)(SCHNORR_APDU_P+64)] & 0x01) != 0);
+            taproot_tweakedkey.getS(recvBuffer, ECDSA_OFFSET_ACC);
+            copyScalar(p_has_odd_y, recvBuffer, ECDSA_OFFSET_ACC, recvBuffer, ECDSA_OFFSET_D);
+            Util.arrayFillNonAtomic(recvBuffer, ECDSA_OFFSET_ACC, (short)32, (byte)0);
+
+            // t = bytes(d) ^ hashBIP0340/aux(a). a is not secret: platform SHA-256.
+            schnorr_hash_tag(tags, (short)0, (short)11, recvBuffer, ECDSA_OFFSET_X, (short)32, recvBuffer, ECDSA_OFFSET_HK);
+            for (short i = (short)0; i < (short)32; i++){
+                recvBuffer[(short)(ECDSA_OFFSET_HK+i)] ^= recvBuffer[(short)(ECDSA_OFFSET_D+i)];
             }
-            // Let rand = hashBIP0340/nonce(t || bytes(P) || m)
-            short offset = 0;
-            Util.arrayCopyNonAtomic(recvBuffer, OFFSET_BIP340_t, buffer, offset, (short)32);
-            offset+=32;
-            offset+=32; // bytes(P) is alread there from previous steps
-            Util.arrayCopyNonAtomic(recvBuffer, OFFSET_BIP340_m, buffer, offset, (short)32);
-            schnorr_hash_tag(tags, (short)11, (short)13, buffer, (short)0, (short)96, recvBuffer, OFFSET_BIP340_t); // reuse t to store rand
+            // rand = hashBIP0340/nonce(t || bytes(P) || m), on the SHA-256 backend selected at
+            // install: this is the one hash of the signature whose input is secret. Computed
+            // twice, the second time from the second copy of m: K and K2.
+            schnorrHash(true, (short)11, (short)13, recvBuffer, ECDSA_OFFSET_HK, buffer, (short)(SCHNORR_APDU_P+1),
+                    recvBuffer, ECDSA_OFFSET_H, recvBuffer, ECDSA_OFFSET_K);
+            schnorrHash(true, (short)11, (short)13, recvBuffer, ECDSA_OFFSET_HK, buffer, (short)(SCHNORR_APDU_P+1),
+                    ecdsaRam, ECDSA_RAM_H2, ecdsaRam, ECDSA_RAM_K2);
+            Util.arrayFillNonAtomic(recvBuffer, ECDSA_OFFSET_HK, (short)32, (byte)0);
+            // nothing is decided from the nonce before the two computations are compared
+            if (!arrayCompareConstantTime(recvBuffer, ECDSA_OFFSET_K, ecdsaRam, ECDSA_RAM_K2, (short)32))
+                ISOException.throwIt(SW_ECDSA_VERIFY_FAILED);
             // k' = rand mod n must not be 0. BIP340 reduces rand mod n, but rand >= n has a
-            // negligible probability (< 2^-127): refuse it, setS() would throw an uncaught exception.
+            // negligible probability (< 2^-127): refuse it, a key object would not take it.
             // rand is the secret nonce: compare in constant time, an early exit would leak its top bits
-            if (Biginteger.isZeroCT(recvBuffer, OFFSET_BIP340_t, (short)32)
-                    || !Biginteger.lessThanCT(recvBuffer, OFFSET_BIP340_t, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32)){
+            if (Biginteger.isZeroCT(recvBuffer, ECDSA_OFFSET_K, (short)32)
+                    | !Biginteger.lessThanCT(recvBuffer, ECDSA_OFFSET_K, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32)){
                 ISOException.throwIt(SW_SCHNORR_INVALID_NONCE);
             }
-            // compute R = rand*G using the scratch ephemeral key (same pattern as in
-            // InitiateSecureChannel, ImportKey and Musig2GenerateNonce), so that the
-            // tweaked private key never has to be borrowed and restored.
-            if (ephemeral_privkey_transient) {
-                Secp256k1.setCommonCurveParameters(ephemeral_privkey);
-            }
-            ephemeral_privkey.setS(recvBuffer, OFFSET_BIP340_t, (short)32);
-            getPublicKey(ephemeral_privkey, tmpBuffer, (short)0); // uncompressed pubkey (65b)
-            // k = rand if has_even_y(R), else n-rand
-            boolean r_has_odd_y = ((tmpBuffer[64] & 0x01) != 0);
-            // e = int(hashBIP0340/challenge(bytes(R) || bytes(P) || m))
-            Util.arrayCopyNonAtomic(tmpBuffer, (short)1, buffer, (short)0, (short)32); // copy R coordx to buffer
-            schnorr_hash_tag(tags, (short)24, (short)17, buffer, (short)0, (short)96, recvBuffer, OFFSET_BIP340_e); 
-            // e is not reduced mod n: the final reduction of k + e*d covers it
 
-            // s = (k + e*d) mod n, computed twice with independent blinding (see blindScalar()).
-            // Both rounds derive d and k again from the key object and from rand, so that a fault
-            // injected in either computation (which would allow to recover d from s, R and P) is
-            // detected by comparing the results. The accumulator overwrites sk, m and aux.
+            // R = rand*G, computed by the platform from the nonce itself
+            setEphemeralScalar(recvBuffer, ECDSA_OFFSET_K);
+            getPublicKey(ephemeral_privkey, buffer, ECDSA_APDU_R); // uncompressed pubkey (65b)
+            // k = rand if has_even_y(R), else n-rand
+            boolean r_has_odd_y = ((buffer[(short)(ECDSA_APDU_R+64)] & 0x01) != 0);
+            // e = int(hashBIP0340/challenge(bytes(R) || bytes(P) || m)): public, platform SHA-256.
+            // e is not reduced mod n: the final reduction of k + e*d covers it
+            schnorrHash(false, (short)24, (short)17, buffer, (short)(ECDSA_APDU_R+1), buffer, (short)(SCHNORR_APDU_P+1),
+                    recvBuffer, ECDSA_OFFSET_H, recvBuffer, ECDSA_OFFSET_HK);
+
+            // s = (k + e*d) mod n, with k and d blinded (see blindScalar()). Computed twice with
+            // independent blinding and compared: a fault in either computation, which would allow
+            // to recover d from s, R and P, is detected.
             for (short round = (short)0; round < (short)2; round++){
-                taproot_tweakedkey.getS(recvBuffer, OFFSET_BIP340_sk);
-                copyScalar(p_has_odd_y, recvBuffer, OFFSET_BIP340_sk, recvBuffer, OFFSET_BIP340_d);
-                copyScalar(r_has_odd_y, recvBuffer, OFFSET_BIP340_t, recvBuffer, OFFSET_BIP340_k);
-                Util.arrayFillNonAtomic(recvBuffer, (short)0, BIGNUM_SIZE, (byte)0);
-                blindedAdd(recvBuffer, (short)0, recvBuffer, OFFSET_BIP340_k);
-                blindedMulAdd(recvBuffer, (short)0, recvBuffer, OFFSET_BIP340_e, recvBuffer, OFFSET_BIP340_d);
-                Biginteger.mod(recvBuffer, (short)0, BIGNUM_SIZE, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32);
-                if (round == (short)0){
-                    // return bytes(R) || s, bytes(R) is already in buffer[0..32)
-                    Util.arrayCopyNonAtomic(recvBuffer, (short)(BIGNUM_SIZE-32), buffer, (short)32, (short)32);
-                }
+                // k = +-rand from the second computation of the nonce, as R was computed from the first
+                copyScalar(r_has_odd_y, ecdsaRam, ECDSA_RAM_K2, ecdsaRam, ECDSA_RAM_V);
+                Util.arrayFillNonAtomic(recvBuffer, ECDSA_OFFSET_ACC, BIGNUM_SIZE, (byte)0);
+                blindedAdd(recvBuffer, ECDSA_OFFSET_ACC, ecdsaRam, ECDSA_RAM_V);
+                blindedMulAdd(recvBuffer, ECDSA_OFFSET_ACC, recvBuffer, ECDSA_OFFSET_HK, recvBuffer, ECDSA_OFFSET_D);
+                Biginteger.mod(recvBuffer, ECDSA_OFFSET_ACC, BIGNUM_SIZE, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32);
+                if (round == (short)0)
+                    Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_PRODUCT, ecdsaRam, ECDSA_RAM_T, (short)32);
             }
-            if (!arrayCompareConstantTime(recvBuffer, (short)(BIGNUM_SIZE-32), buffer, (short)32, (short)32))
+            if (!arrayCompareConstantTime(recvBuffer, ECDSA_OFFSET_PRODUCT, ecdsaRam, ECDSA_RAM_T, (short)32))
                 ISOException.throwIt(SW_INTERNAL_ERROR);
+
+            // bytes(R) || bytes(s), built aside in recvBuffer[0..64)
+            Util.arrayCopyNonAtomic(buffer, (short)(ECDSA_APDU_R+1), recvBuffer, ECDSA_OFFSET_ACC, (short)32);
+            Util.arrayCopyNonAtomic(ecdsaRam, ECDSA_RAM_T, recvBuffer, (short)(ECDSA_OFFSET_ACC+32), (short)32);
             sizeout = (short)64;
+            Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_ACC, buffer, (short)0, sizeout);
         } finally {
-            // buffer[0..96) held t (derived from d) and the hashed messages
-            clearSigningScratch(buffer, sizeout, (short)96);
+            Sha256.clear();
+            clearSigningScratch(buffer, sizeout, SCHNORR_APDU_SIZE);
         }
         return sizeout;
     }
-    
+
+    /**
+     * dst = BIP340 tagged hash of the 96-byte message a | b | c (32 bytes each), for the tag at
+     * tags[tagOff]. With secret set, the message goes through Sha256, i.e. the backend selected
+     * at install (platform or bytecode); otherwise through the platform MessageDigest.
+     * SHA256(tag) is public and always computed by the platform. Uses tmpBuffer[0..32).
+     */
+    private void schnorrHash(boolean secret, short tagOff, short tagLen,
+            byte[] a, short aOff, byte[] b, short bOff, byte[] c, short cOff, byte[] dst, short dstOff) {
+        sha256.reset();
+        sha256.doFinal(tags, tagOff, tagLen, tmpBuffer, (short)0);
+        if (secret) {
+            Sha256.reset();
+            Sha256.update(tmpBuffer, (short)0, (short)32);
+            Sha256.update(tmpBuffer, (short)0, (short)32);
+            Sha256.update(a, aOff, (short)32);
+            Sha256.update(b, bOff, (short)32);
+            Sha256.doFinal(c, cOff, (short)32, dst, dstOff);
+        } else {
+            sha256.update(tmpBuffer, (short)0, (short)32);
+            sha256.update(tmpBuffer, (short)0, (short)32);
+            sha256.update(a, aOff, (short)32);
+            sha256.update(b, bOff, (short)32);
+            sha256.doFinal(c, cOff, (short)32, dst, dstOff);
+        }
+    }
+
     // BIP0340 tagged hash: dst = SHA256(SHA256(tag) || SHA256(tag) || msg)
     // The message is hashed in place (streamed), so its length is not bounded by a scratch buffer.
     // This function uses tmpBuffer[0..32) for the tag hash, hence msg must not be stored there.

@@ -74,6 +74,14 @@ public class EcdsaExposedAppletTest {
     SatochipTest.checkBip461Vectors(cmd, SLOT, VECTOR_COUNT);
   }
 
+  @Test
+  @DisplayName("BIP340 signatures match the reference signer on the bytecode SHA-256 backend")
+  void bip340OnBytecodeSha256Test() {
+    // the nonce hash of SignSchnorrHash goes through the backend selected at install
+    assertEquals(Sha256.BACKEND_BYTECODE, Sha256.getBackend());
+    SatochipTest.checkBip340Reference(cmd, SLOT, 4);
+  }
+
   // ---- the signature check, called directly ---------------------------------------------------
 
   static final int SW_ECDSA_VERIFY_FAILED = 0x9C4D;
