@@ -523,6 +523,100 @@ public class Biginteger {
     }
 
     /**
+     * z[offz .. offz+sizex+sizey) = x * y, computed in bytecode: no platform engine sees the
+     * operands. Schoolbook multiplication on bytes, sizex*sizey steps. The sequence of
+     * operations does not depend on the values. z must not overlap x or y.
+     * (Measurement prototype of branch betternonce-bytecode-mul.)
+     */
+    public static void mult_bytecode(byte[] x, short offx, short sizex, byte[] y, short offy, short sizey, byte[] z, short offz) {
+        Util.arrayFillNonAtomic(z, offz, (short)(sizex+sizey), (byte)0);
+        for (short i = (short)(sizex-1); i >= (short)0; i--) {
+            short xi = (short)(x[(short)(offx+i)] & 0xFF);
+            short carry = (short)0;
+            short k = (short)(offz+i+sizey);
+            for (short j = (short)(offy+sizey-1); j >= offy; j--, k--) {
+                // 255*255 + 255 + 255 = 65535: fits 16 bits, read as unsigned
+                short t = (short)((short)(xi * (short)(y[j] & 0xFF)) + (short)(z[k] & 0xFF) + carry);
+                z[k] = (byte)t;
+                carry = (short)((short)(t >> 8) & 0xFF);
+            }
+            z[k] = (byte)carry;
+        }
+    }
+
+    /** c = 2^256 - n for the order n of secp256k1 (129 bits) */
+    private static final byte[] SECP256K1_ORDER_C = {
+        (byte)0x01, (byte)0x45, (byte)0x51, (byte)0x23, (byte)0x19, (byte)0x50, (byte)0xB7, (byte)0x5F, (byte)0xC4,
+        (byte)0x40, (byte)0x2D, (byte)0xA1, (byte)0x73, (byte)0x2F, (byte)0xC9, (byte)0xBE, (byte)0xBF};
+    private static final short ORDER_C_SIZE = (short)17;
+
+    /**
+     * One folding step modulo n = 2^256 - c: for v = hi*2^256 + lo, with hi the hiLen bytes at
+     * src[sOff] and lo the 32 bytes after them, writes hi*c + lo (congruent to v) at dst[0..len)
+     * and returns len = max(hiLen+17, 33). dst must not be src.
+     */
+    private static short foldOrder(byte[] src, short sOff, short hiLen, byte[] dst) {
+        short prodLen = (short)(hiLen + ORDER_C_SIZE);
+        short outLen = prodLen < (short)33 ? (short)33 : prodLen;
+        short pad = (short)(outLen - prodLen);
+        Util.arrayFillNonAtomic(dst, (short)0, pad, (byte)0);
+        mult_bytecode(src, sOff, hiLen, SECP256K1_ORDER_C, (short)0, ORDER_C_SIZE, dst, pad);
+        short carry = (short)0;
+        short i = (short)(outLen-1);
+        short lo = (short)(sOff+hiLen);
+        for (short j = (short)(lo+31); j >= lo; j--, i--) {
+            short t = (short)((short)(dst[i] & 0xFF) + (short)(src[j] & 0xFF) + carry);
+            dst[i] = (byte)t;
+            carry = (short)((short)(t >> 8) & 0xFF);
+        }
+        for (; i >= (short)0; i--) {
+            short t = (short)((short)(dst[i] & 0xFF) + carry);
+            dst[i] = (byte)t;
+            carry = (short)((short)(t >> 8) & 0xFF);
+        }
+        return outLen;
+    }
+
+    /**
+     * out[offout..+32) = x mod n, for the 64-byte x at x[offx] and the order n of secp256k1,
+     * computed in bytecode with the special form n = 2^256 - c: three folding steps, one more
+     * for the last carry, one conditional subtraction. The sequence of operations does not
+     * depend on the value. Uses buffer1 and buffer2; x may be neither of them.
+     * (Measurement prototype of branch betternonce-bytecode-mul.)
+     */
+    public static void mod_order_bytecode(byte[] x, short offx, byte[] out, short offout) {
+        foldOrder(x, offx, (short)32, buffer1);            // 49 bytes
+        foldOrder(buffer1, (short)0, (short)17, buffer2);   // 34 bytes
+        foldOrder(buffer2, (short)0, (short)2, buffer1);    // 33 bytes, the first one is 0 or 1
+        // v = buffer1[1..33) + buffer1[0]*c, below 2^256
+        short mask = (short)(-(short)(buffer1[0] & 0x01));
+        short carry = (short)0;
+        short i = (short)32;
+        for (short j = (short)(ORDER_C_SIZE-1); j >= (short)0; j--, i--) {
+            short t = (short)((short)(buffer1[i] & 0xFF) + (short)(SECP256K1_ORDER_C[j] & mask & 0xFF) + carry);
+            buffer1[i] = (byte)t;
+            carry = (short)((short)(t >> 8) & 0xFF);
+        }
+        for (; i >= (short)1; i--) {
+            short t = (short)((short)(buffer1[i] & 0xFF) + carry);
+            buffer1[i] = (byte)t;
+            carry = (short)((short)(t >> 8) & 0xFF);
+        }
+        // v - n in buffer2; keep it if there was no borrow (v >= n)
+        short borrow = (short)0;
+        for (i = (short)31; i >= (short)0; i--) {
+            short t = (short)((short)(buffer1[(short)(i+1)] & 0xFF)
+                    - (short)(Secp256k1.SECP256K1[(short)(Secp256k1.OFFSET_SECP256K1_R+i)] & 0xFF) - borrow);
+            buffer2[i] = (byte)t;
+            borrow = (short)((short)(t >> 8) & 0x01);
+        }
+        mask = (short)(borrow - 1); // 0xFFFF if v >= n: take the difference
+        for (i = (short)0; i < (short)32; i++) {
+            out[(short)(offout+i)] = (byte)((buffer2[i] & mask) | (buffer1[(short)(i+1)] & ~mask));
+        }
+    }
+
+    /**
      * Compute x mod y
      * <P>
      * x and y are copied to local arrays Biginteger.buffer1 and Biginteger.buffer2.

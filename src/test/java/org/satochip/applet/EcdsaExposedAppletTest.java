@@ -55,7 +55,7 @@ public class EcdsaExposedAppletTest {
     engine = JavaCardEngine.create();
     byte[] aid = SatochipTest.SATOCHIP_INSTANCE_AID;
     engine.installExposedApplet(new AID(aid, (short) 0, (byte) aid.length), Satochip.class,
-        new byte[]{Sha256.BACKEND_BYTECODE});
+        new byte[]{Sha256.BACKEND_BYTECODE, (byte) 0x01}); // and the bytecode multiplication
 
     cmd = new TestSatochipCommandSet(new PCSCCardChannel(
         engine.toTerminalFactory().terminals().list().get(0).connect("*").getBasicChannel()));
@@ -72,6 +72,10 @@ public class EcdsaExposedAppletTest {
   void bip461VectorsOnBytecodeSha256Test() throws Exception {
     assertEquals(Sha256.BACKEND_BYTECODE, Sha256.getBackend(),
         "install data 0x01 must select the bytecode backend");
+    byte[] aid = SatochipTest.SATOCHIP_INSTANCE_AID;
+    Satochip applet = (Satochip) engine.getApplet(new AID(aid, (short) 0, (byte) aid.length));
+    assertEquals(Boolean.TRUE, field(applet, "mulBytecode"),
+        "second install byte 0x01 must select the bytecode multiplication");
     SatochipTest.checkBip461Vectors(cmd, SLOT, VECTOR_COUNT);
   }
 
