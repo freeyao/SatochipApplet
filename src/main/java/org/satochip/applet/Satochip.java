@@ -589,7 +589,10 @@ public class Satochip extends javacard.framework.Applet {
         HmacSha512.init(tmpBuffer);
         // SHA-256 for the nonce derivation of the self-built ECDSA: platform or bytecode backend,
         // selected by the first byte of the applet-specific install data (see getInstallOption())
-        Sha256.init(sha256, getInstallOption(bArray, bOffset, bLength));
+        Sha256.init(sha256, getInstallOption(bArray, bOffset, bLength, (short)0));
+        // modular multiplications on secret operands: RSA squaring engine (0) or bytecode (1),
+        // selected by the second byte of the applet-specific install data
+        mulBytecode = getInstallOption(bArray, bOffset, bLength, (short)1) == (byte)1;
         HmacSha256.init(tmpBuffer);
         try {
             keyAgreement = KeyAgreement.getInstance(ALG_EC_SVDP_DH_PLAIN_XY, false); 
@@ -685,14 +688,16 @@ public class Satochip extends javacard.framework.Applet {
     } // end of constructor
 
     /**
-     * Returns the first byte of the applet-specific install data, or 0 if there is none.
+     * Returns byte `index` of the applet-specific install data, or 0 if it is absent.
      * The install parameters are [aid_size(1b) | AID | info_size(1b) | control info | data_size(1b) | data].
-     * The only option so far selects the SHA-256 backend of the self-built ECDSA nonce derivation:
+     * Byte 0 selects the SHA-256 backend of the self-built ECDSA nonce derivation:
      * 0x00 or absent: Sha256.BACKEND_PLATFORM, 0x01: Sha256.BACKEND_BYTECODE
-     * (e.g. `gp --install applet.cap --params 01`). Both backends compute the same function,
-     * so the signatures do not depend on this choice.
+     * (e.g. `gp --install applet.cap --params 01`).
+     * Byte 1 (measurement branch) selects how secret operands are multiplied: 0x00 or absent:
+     * RSA squaring engine, 0x01: bytecode (e.g. `--params 0001`).
+     * All combinations compute the same function, so the signatures do not depend on them.
      */
-    private static byte getInstallOption(byte[] bArray, short bOffset, byte bLength) {
+    private static byte getInstallOption(byte[] bArray, short bOffset, byte bLength, short index) {
         short end = (short)(bOffset + (short)(bLength & 0xFF));
         short off = bOffset;
         if (off >= end)
@@ -701,10 +706,20 @@ public class Satochip extends javacard.framework.Applet {
         if (off >= end)
             return (byte)0;
         off += (short)(1 + (short)(bArray[off] & 0xFF)); // skip the control info
-        if ((short)(off + 1) >= end || bArray[off] == (byte)0)
+        // bArray[off] is the length of the applet-specific data
+        if (off >= end || (short)(bArray[off] & 0xFF) <= index || (short)(off + 1 + index) >= end)
             return (byte)0;
-        return bArray[(short)(off + 1)];
+        return bArray[(short)(off + 1 + index)];
     }
+
+    /**
+     * MEASUREMENT BRANCH (betternonce-bytecode-mul). True: the modular multiplications of the
+     * self-built ECDSA whose operands are secret are done in bytecode (Biginteger.mult_bytecode()
+     * and mod_order_bytecode()), so that the RSA squaring engine is not given them. False: the
+     * path of 256c080, blinded RSA squaring. Second byte of the install data: 00 or 01.
+     * The verification multiplies public values and stays on the RSA engine in both cases.
+     */
+    private boolean mulBytecode;
 
     /** SHA256("abc"), FIPS 180-4. */
     private static final byte[] SELFTEST_SHA256_ABC = {
@@ -2933,6 +2948,7 @@ public class Satochip extends javacard.framework.Applet {
      *      4: Biginteger.mod alone, on the 64 bytes a|b                      return (a|b) mod n
      *      5: bytecode multiplication, then mod_order_bytecode (folding)     return a*b mod n
      *      6: mod_order_bytecode alone, on the 64 bytes a|b                  return (a|b) mod n
+     *      7: nothing; returns [sha256 backend | multiplication backend] of this instance
      * p2: count (1..255)
      * data: [a(32b) | b(32b)]
      */
@@ -2963,7 +2979,7 @@ public class Satochip extends javacard.framework.Applet {
                 resOff = (short)32; resLen = (short)32;
                 break;
             case (byte)3:
-                mulModOrder(ecdsaRam, (short)0, ecdsaRam, (short)32);
+                mulModOrderRsa(ecdsaRam, (short)0, ecdsaRam, (short)32);
                 resOff = ECDSA_OFFSET_PRODUCT; resLen = (short)32;
                 break;
             case (byte)4:
@@ -2980,6 +2996,11 @@ public class Satochip extends javacard.framework.Applet {
                 Biginteger.mod_order_bytecode(ecdsaRam, (short)0, recvBuffer, (short)0);
                 resLen = (short)32;
                 break;
+            case (byte)7:
+                recvBuffer[0] = Sha256.getBackend();
+                recvBuffer[1] = mulBytecode ? (byte)1 : (byte)0;
+                resLen = (short)2;
+                break;
             default:
                 ISOException.throwIt(SW_INCORRECT_P1);
             }
@@ -2994,6 +3015,17 @@ public class Satochip extends javacard.framework.Applet {
      * random. a and x must lie outside ACC and outside tmpBuffer.
      */
     private void mulModOrder(byte[] a, short aOff, byte[] x, short xOff) {
+        if (mulBytecode) {
+            // no engine, no blinding: 64-byte product at ACC[0..64), reduced into PRODUCT = ACC[64..96)
+            Biginteger.mult_bytecode(a, aOff, (short)32, x, xOff, (short)32, recvBuffer, ECDSA_OFFSET_ACC);
+            Biginteger.mod_order_bytecode(recvBuffer, ECDSA_OFFSET_ACC, recvBuffer, ECDSA_OFFSET_PRODUCT);
+            return;
+        }
+        mulModOrderRsa(a, aOff, x, xOff);
+    }
+
+    /** mulModOrder() on the RSA squaring engine, with x blinded as x + m*n (the path of 256c080). */
+    private void mulModOrderRsa(byte[] a, short aOff, byte[] x, short xOff) {
         Util.arrayFillNonAtomic(recvBuffer, ECDSA_OFFSET_ACC, BIGNUM_SIZE, (byte)0);
         blindedMulAdd(recvBuffer, ECDSA_OFFSET_ACC, a, aOff, x, xOff);
         Biginteger.mod(recvBuffer, ECDSA_OFFSET_ACC, BIGNUM_SIZE, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32);
@@ -3055,6 +3087,24 @@ public class Satochip extends javacard.framework.Applet {
         mulModOrder(recvBuffer, ECDSA_OFFSET_X, ecdsaRam, ECDSA_RAM_K2);
         Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_PRODUCT, ecdsaRam, (short)(ECDSA_RAM_INV+32), (short)32);
         invertModOrder();
+        if (mulBytecode) {
+            // v = b*h + r*(b*d) mod n. In bytecode nothing blinds the operands, and r is known to
+            // whoever watches the card: d is therefore never multiplied by r, only by the fresh
+            // random b, and r multiplies b*d, which is a new uniformly random value each time.
+            // One multiplication more than the RSA path.
+            mulModOrder(recvBuffer, ECDSA_OFFSET_X, recvBuffer, ECDSA_OFFSET_D);            // b*d
+            Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_PRODUCT, ecdsaRam, ECDSA_RAM_V, (short)32);
+            mulModOrder(recvBuffer, ECDSA_OFFSET_X, recvBuffer, ECDSA_OFFSET_H);            // b*h
+            Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_PRODUCT, ecdsaRam, ECDSA_RAM_T, (short)32);
+            mulModOrder(buffer, (short)(ECDSA_APDU_R+1), ecdsaRam, ECDSA_RAM_V);            // r*(b*d)
+            Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_PRODUCT, ecdsaRam, ECDSA_RAM_V, (short)32);
+            Biginteger.addModCT(ecdsaRam, ECDSA_RAM_V, ecdsaRam, ECDSA_RAM_T,
+                    Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32, recvBuffer, ECDSA_OFFSET_ACC);
+            // s = u^-1 * v mod n
+            mulModOrder(ecdsaRam, (short)(ECDSA_RAM_INV+32), ecdsaRam, ECDSA_RAM_V);
+            Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_PRODUCT, ecdsaRam, ECDSA_RAM_T, (short)32);
+            return;
+        }
         // t = h + r*d mod n, with d blinded
         Util.arrayFillNonAtomic(recvBuffer, ECDSA_OFFSET_ACC, BIGNUM_SIZE, (byte)0);
         Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_H, recvBuffer, ECDSA_OFFSET_PRODUCT, (short)32);
