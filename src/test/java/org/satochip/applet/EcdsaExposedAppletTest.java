@@ -9,6 +9,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.satochip.desktop.PCSCCardChannel;
+import org.satochip.io.APDUResponse;
 import pro.javacard.engine.JavaCardEngine;
 
 import java.lang.reflect.Field;
