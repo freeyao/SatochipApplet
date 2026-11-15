@@ -2944,6 +2944,16 @@ public class Satochip extends javacard.framework.Applet {
      * anything from it when k or one of its working copies was altered (rule 2 of "Redundancy").
      */
     private void ecdsaComputeR(byte[] buffer) {
+        ecdsaComputeRPoint(buffer);
+        // r = x(R) mod n
+        reduceModOrder(buffer, (short)(ECDSA_APDU_R+1));
+    }
+
+    /**
+     * The computation of R of ecdsaComputeR(), with all its checks, leaving the point as it is
+     * (65 bytes at buffer[ECDSA_APDU_R]): BIP340 needs x(R) itself and the parity of y(R).
+     */
+    private void ecdsaComputeRPoint(byte[] buffer) {
         // Q = w*G
         randomScalar(recvBuffer, ECDSA_OFFSET_X);
         setEphemeralScalar(recvBuffer, ECDSA_OFFSET_X);
@@ -2969,8 +2979,6 @@ public class Satochip extends javacard.framework.Applet {
         // K must still be what K2 is, before anything is done with R
         if (!arrayCompareConstantTime(recvBuffer, ECDSA_OFFSET_K, ecdsaRam, ECDSA_RAM_K2, (short)32))
             ISOException.throwIt(SW_ECDSA_VERIFY_FAILED);
-        // r = x(R) mod n
-        reduceModOrder(buffer, (short)(ECDSA_APDU_R+1));
     }
 
     /**
@@ -3314,8 +3322,8 @@ public class Satochip extends javacard.framework.Applet {
      * second computation of the nonce at K2. buffer[0..195) is used, the hash and the auxiliary
      * data must lie in buffer[0..130) and are read before anything is written there.
      *
-     * This version: the nonce hash is computed twice and compared; R is still computed by the
-     * platform from the nonce itself, and s is computed twice and compared.
+     * R = rand*G is computed as (rand * w^-1) * (w*G), so that the EC engine does not receive
+     * the nonce (see ecdsaComputeRPoint()); s is computed twice and compared.
      * @return 64
      */
     private short signSchnorr(byte[] buffer, short hashOffset, short auxOffset) {
@@ -3368,9 +3376,10 @@ public class Satochip extends javacard.framework.Applet {
                 ISOException.throwIt(SW_SCHNORR_INVALID_NONCE);
             }
 
-            // R = rand*G, computed by the platform from the nonce itself
-            setEphemeralScalar(recvBuffer, ECDSA_OFFSET_K);
-            getPublicKey(ephemeral_privkey, buffer, ECDSA_APDU_R); // uncompressed pubkey (65b)
+            // R = rand*G without handing rand to the EC engine: (rand * w^-1) * (w*G) for a fresh
+            // random w, as for ECDSA. Refuses to go on if the scalar that goes to the engine, or K
+            // itself, no longer matches K2.
+            ecdsaComputeRPoint(buffer);
             // k = rand if has_even_y(R), else n-rand
             boolean r_has_odd_y = ((buffer[(short)(ECDSA_APDU_R+64)] & 0x01) != 0);
             // e = int(hashBIP0340/challenge(bytes(R) || bytes(P) || m)): public, platform SHA-256.
