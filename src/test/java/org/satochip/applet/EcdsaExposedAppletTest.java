@@ -76,6 +76,11 @@ public class EcdsaExposedAppletTest {
     Satochip applet = (Satochip) engine.getApplet(new AID(aid, (short) 0, (byte) aid.length));
     assertEquals(Boolean.TRUE, field(applet, "mulBytecode"),
         "second install byte 0x01 must select the bytecode multiplication");
+    // and GET_STATUS reports both
+    byte[] status = cmd.cardGetStatus().getData();
+    assertEquals(20, status.length);
+    assertEquals(0x01, status[18], "GET_STATUS: SHA-256 backend");
+    assertEquals(0x01, status[19], "GET_STATUS: multiplication backend");
     SatochipTest.checkBip461Vectors(cmd, SLOT, VECTOR_COUNT);
   }
 

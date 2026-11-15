@@ -8,6 +8,32 @@ Satochip applet full versions follows this format: vX.Y-Z.W where:
 * X.Y refers to the PROTOCOL VERSION: changes that impact compatibility with the client side (e.g new functionalities, major patch...)
 * Z.W refers to changes with no impact on compatibility of the client (e.g minor patches, optimizations...)
 
+## [0.19-0.1]
+
+SignSchnorrHash is rebuilt like the self-built ECDSA of 0.17, and the multiplications on secret values can be done in bytecode. The protocol version becomes 0.19 because SignSchnorrHash takes a new parameter and GetStatus returns two more bytes. (0.18 is the number used by the anti-exfil branch, which is not part of this version.)
+
+### Changes for clients
+
+* **SignSchnorrHash (0x7B):** send P2 = 0x01 and 32 bytes of fresh random data after the hash. A client that keeps sending the hash alone with P2 = 0x00 still gets a valid BIP340 signature, made with all-zero auxiliary data.
+* **GetStatus (0x3C)** returns 20 bytes instead of 18: byte 18 is the SHA-256 backend (0x00 platform, 0x01 bytecode), byte 19 the multiplication backend (0x00 RSA squaring engine, 0x01 bytecode), as selected at install. Two cards with different backends produce the same signatures; these bytes are the only way for a client to tell them apart.
+
+### New features
+
+* **Multiplication backend selected at install** (second byte of the install data, e.g. `--params 0001`; absent or `00`: RSA squaring engine as before, `01`: bytecode). It applies to the modular multiplications whose operands are secret, in SignTransactionHash and SignSchnorrHash. Signatures do not depend on it.
+  * with `01` the RSA squaring engine is no longer handed values congruent to the nonce or the private key. The products are computed by `Biginteger.mult_bytecode()` (schoolbook, byte by byte) and reduced by `mod_order_bytecode()` (folding with 2^256 - n; no data-dependent branch or index);
+  * in bytecode nothing masks the operands, so a secret is never multiplied by a value an observer knows: ECDSA computes b\*h + r\*(b\*d) for a random b, Schnorr splits d into two random shares and computes k + e\*d1 + e\*d2;
+  * what this choice relies on instead: a power analysis of a **single** trace is not kept from reading the bytes of an operand, and reading b (ECDSA) or both shares (Schnorr) gives the private key. Not measured on a card. The RSA engine is still used for the modular inversions (of values masked by a random factor) and for the verifications (public values); the EC engine and the key object are as before;
+  * measured on a JCOP4 P71 for ECDSA: faster than the RSA backend (about 4.4 s instead of 5.0 s for a signature without grinding, platform SHA-256).
+* **SignSchnorrHash (0x7B) is computed like the self-built ECDSA.** Signatures are unchanged byte for byte (they are plain BIP340 signatures); what changes is how the card gets there:
+  * the nonce hash, the one hash with a secret input, goes through the SHA-256 backend selected at install (platform or bytecode);
+  * R = rand\*G is computed as (rand\*w^-1)\*(w\*G) for a random w: the platform's point multiplication no longer receives the nonce;
+  * the signature is verified on the card (s\*G - e\*P, with P and e computed again) before it is returned. If it does not verify, `0x9C4D` is returned and nothing is output. This replaces the second computation of s, which could not detect a wrong R or a wrong e;
+  * redundancy against the same kind of fault as for ECDSA (one bit of one stored value flipped during a command): the message is held twice, the nonce is computed twice and compared before anything depends on it, e is computed once for s and once more for the verification, s is held twice;
+  * what the platform still sees: the RSA engine is handed values congruent to the nonce and to the private key (blinded by a multiple of n, which leaves their top 8 bits unblinded), the EC engine w and rand\*w^-1, and the key object holds the private key. Same limits as for ECDSA.
+* **SignSchnorrHash (0x7B): the BIP340 auxiliary random data comes from the host, no longer from the card's random generator.** P2 = 0x01: the data is `[hash(32) | aux(32) | optional 2FA fields]`. P2 = 0x00 (the format of earlier clients, unchanged): the auxiliary data is 32 zero bytes, which BIP340 allows. Any other P2 returns `SW_INCORRECT_P2`.
+  * a card that draws the auxiliary data itself can choose it so that R, which ends up on chain, carries information; with host-supplied data the signature is a function of the key, the hash and that data only, and can be compared byte for byte with any BIP340 signer. The official BIP340 signing vectors are now part of the tests;
+  * what this does not give: a host cannot check, without the private key, that the card used the data it sent; and auxiliary data that repeats (always with P2 = 0x00, or a host that resends it) makes the nonce repeat for the same key and hash, so it adds no protection against fault attacks. BIP340 recommends fresh random data: clients should send it.
+
 ## [0.17-0.1]
 
 SignTransactionHash no longer uses the card's black-box ECDSA, and the three signatures that keys made of their own public key are gone. The protocol version becomes 0.17 because three response formats change.
@@ -30,20 +56,6 @@ SignTransactionHash no longer uses the card's black-box ECDSA, and the three sig
   * Command and response format are unchanged (DER). Signatures are at most 70 bytes; the client-side low-S normalization is no longer needed. New status words: `0x9C4D` (the signature did not verify, or two copies of a value that must be equal differ) and `0x9C4E` (no acceptable nonce within 64 grinding counters, or 4 unacceptable nonce candidates or random draws in a row; neither is expected to happen).
   * A signature now takes several RSA and EC operations instead of one, and the time varies with the number of grinding attempts. Timings on a card: to be measured (`./gradlew benchmarkCard`).
 * **SHA-256 backend selected at install** for the nonce derivation: the platform MessageDigest (default) or an implementation in JavaCard bytecode, with which the private key and the nonce do not enter a platform primitive at all. Select the bytecode backend with install data `01` (`gp --install applet.cap --params 01`, or `./gradlew install -Porg.satochip.install.params=01`). The signatures are the same with both.
-* **Multiplication backend selected at install** (second byte of the install data, e.g. `--params 0001`; absent or `00`: RSA squaring engine as before, `01`: bytecode). It applies to the modular multiplications whose operands are secret, in SignTransactionHash and SignSchnorrHash. Signatures do not depend on it.
-  * with `01` the RSA squaring engine is no longer handed values congruent to the nonce or the private key. The products are computed by `Biginteger.mult_bytecode()` (schoolbook, byte by byte) and reduced by `mod_order_bytecode()` (folding with 2^256 - n; no data-dependent branch or index);
-  * in bytecode nothing masks the operands, so a secret is never multiplied by a value an observer knows: ECDSA computes b\*h + r\*(b\*d) for a random b, Schnorr splits d into two random shares and computes k + e\*d1 + e\*d2;
-  * what this choice relies on instead: a power analysis of a **single** trace is not kept from reading the bytes of an operand, and reading b (ECDSA) or both shares (Schnorr) gives the private key. Not measured on a card. The RSA engine is still used for the modular inversions (of values masked by a random factor) and for the verifications (public values); the EC engine and the key object are as before;
-  * measured on a JCOP4 P71 for ECDSA: faster than the RSA backend (about 4.4 s instead of 5.0 s for a signature without grinding, platform SHA-256). GET_STATUS does not report the backend yet.
-* **SignSchnorrHash (0x7B) is computed like the self-built ECDSA.** Signatures are unchanged byte for byte (they are plain BIP340 signatures); what changes is how the card gets there:
-  * the nonce hash, the one hash with a secret input, goes through the SHA-256 backend selected at install (platform or bytecode);
-  * R = rand\*G is computed as (rand\*w^-1)\*(w\*G) for a random w: the platform's point multiplication no longer receives the nonce;
-  * the signature is verified on the card (s\*G - e\*P, with P and e computed again) before it is returned. If it does not verify, `0x9C4D` is returned and nothing is output. This replaces the second computation of s, which could not detect a wrong R or a wrong e;
-  * redundancy against the same kind of fault as for ECDSA (one bit of one stored value flipped during a command): the message is held twice, the nonce is computed twice and compared before anything depends on it, e is computed once for s and once more for the verification, s is held twice;
-  * what the platform still sees: the RSA engine is handed values congruent to the nonce and to the private key (blinded by a multiple of n, which leaves their top 8 bits unblinded), the EC engine w and rand\*w^-1, and the key object holds the private key. Same limits as for ECDSA.
-* **SignSchnorrHash (0x7B): the BIP340 auxiliary random data comes from the host, no longer from the card's random generator.** P2 = 0x01: the data is `[hash(32) | aux(32) | optional 2FA fields]`. P2 = 0x00 (the format of earlier clients, unchanged): the auxiliary data is 32 zero bytes, which BIP340 allows. Any other P2 returns `SW_INCORRECT_P2`.
-  * a card that draws the auxiliary data itself can choose it so that R, which ends up on chain, carries information; with host-supplied data the signature is a function of the key, the hash and that data only, and can be compared byte for byte with any BIP340 signer. The official BIP340 signing vectors are now part of the tests;
-  * what this does not give: a host cannot check, without the private key, that the card used the data it sent; and auxiliary data that repeats (always with P2 = 0x00, or a host that resends it) makes the nonce repeat for the same key and hash, so it adds no protection against fault attacks. BIP340 recommends fresh random data: clients should send it.
 
 ### Security
 

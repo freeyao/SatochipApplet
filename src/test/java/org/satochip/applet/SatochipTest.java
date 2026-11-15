@@ -285,9 +285,12 @@ public class SatochipTest {
   @DisplayName("GET STATUS reports the expected fields")
   void getStatusTest() {
     byte[] s = cmdSet.cardGetStatus().getData();
-    assertEquals(18, s.length, "GET_STATUS payload length");
+    assertEquals(20, s.length, "GET_STATUS payload length");
     assertEquals(0x00, s[0], "protocol major version");
-    assertEquals(0x11, s[1], "protocol minor version (0.17)");
+    assertEquals(0x13, s[1], "protocol minor version (0.19)");
+    // the suite installs the applet without install data: platform SHA-256, RSA squaring engine
+    assertEquals(0x00, s[18], "SHA-256 backend");
+    assertEquals(0x00, s[19], "multiplication backend");
     assertEquals(5, s[4], "PIN tries remaining should be back at the maximum");
     assertEquals(0x01, s[10], "setup done");
     assertEquals(0x01, s[11], "secure channel is always enabled");

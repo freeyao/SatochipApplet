@@ -114,7 +114,7 @@ public class Satochip extends javacard.framework.Applet {
     // 0.16-0.1: security fixes & hardening (ResetKey 2FA HMAC fix, EC point validation, Musig2SignHash 2FA fix, MuSig2 nonce counter overflow fix, resetToFactory completion, BIP341 taproot tweak fix, ImportKey hardening, constant-time MAC comparisons, reset-to-factory refactoring, authentikey mgmt, transient AES session keys, removal of ParseTransaction/SignTransaction/signMessage, add GET_RANDOM, single PIN/PUK mgmt, ...)
     // 0.17-0.1: self-built ECDSA for SignTransactionHash (BIP461: RFC 6979 nonce, low-r, low-S, verified before output) instead of the platform Signature engine; the three self-signatures are removed and the full public key is returned instead (getBIP32ExtendedKey, getPublicKeyFromPrivate, InitiateSecureChannel: new response formats)
     private final static byte PROTOCOL_MAJOR_VERSION = (byte) 0; 
-    private final static byte PROTOCOL_MINOR_VERSION = (byte) 17;
+    private final static byte PROTOCOL_MINOR_VERSION = (byte) 19;
     private final static byte APPLET_MAJOR_VERSION = (byte) 0;
     private final static byte APPLET_MINOR_VERSION = (byte) 1;
 
@@ -1987,7 +1987,11 @@ public class Satochip extends javacard.framework.Applet {
      *  data: none
      *  return: [versions(4b) | PIN0-PUK0-PIN1-PUK1 tries (4b) |
      *           needs2FA (1b) | is_seeded(1b) | setupDone(1b) | needs_secure_channel(1b) |
-     *           nfc_policy(1b) | schnorr_policy(1b) | nostr_policy(1b) | liquid_policy(1b) | musig2_policy(1b) | random_policy(1b)]
+     *           nfc_policy(1b) | schnorr_policy(1b) | nostr_policy(1b) | liquid_policy(1b) | musig2_policy(1b) | random_policy(1b) |
+     *           sha256_backend(1b) | multiplication_backend(1b)]
+     *  The last two bytes (from protocol 0.19) are the choices made at install: 0x00 platform
+     *  MessageDigest / RSA squaring engine, 0x01 bytecode. The signatures do not depend on them,
+     *  so this is the only way for a client to know which one a card runs.
      */
     private short GetStatus(APDU apdu, byte[] buffer) {
 
@@ -2028,6 +2032,9 @@ public class Satochip extends javacard.framework.Applet {
         buffer[pos++] = feature_liquid_policy;
         buffer[pos++] = feature_musig2_policy;
         buffer[pos++] = feature_random_policy;
+        // backends selected at install (offset 18-19)
+        buffer[pos++] = Sha256.getBackend();
+        buffer[pos++] = mulBytecode ? (byte)0x01 : (byte)0x00;
 
         return pos;
     }
