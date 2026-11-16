@@ -76,4 +76,11 @@ public class ExposedRsaMultiplicationTest {
   void bip340ReferenceTest() {
     SatochipTest.checkBip340Reference(cmd, SLOT, 4);
   }
+
+  @Test
+  @DisplayName("MuSig2 partial signatures verify on bytecode SHA-256 with the RSA multiplication backend")
+  void musig2PartialSignatureTest() {
+    assertEquals(SatochipTest.SW_OK, cmd.cardBip32ImportSeed(Vectors.BIP32_SEED).getSw());
+    SatochipTest.checkMusig2PartialSignatures(cmd);
+  }
 }
