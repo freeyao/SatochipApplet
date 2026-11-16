@@ -3299,6 +3299,15 @@ public class Satochip extends javacard.framework.Applet {
      * can be compared byte for byte with any other BIP340 signer. When the host supplies none
      * (p2 = 0x00, the format of earlier clients), a is 32 zero bytes, which BIP340 allows.
      *
+     * Known and kept as they are (project lead, 2026-11-15):
+     *   - with p2 = 0x00 the nonce of a given key and hash is always the same, as it is for the
+     *     deterministic ECDSA of SignTransactionHash. For such a client two signatures with the
+     *     same nonce are the normal case, not something an attacker has to arrange. With
+     *     p2 = 0x01 this happens only if the host sends the same a again;
+     *   - the 2FA HMAC covers the hash and not a: whoever stands between the 2FA device and
+     *     the card can replace a. It cannot choose the nonce that way (the derivation mixes
+     *     the private key in), and it can replay an approved request as a whole anyway.
+     *
      * ins: 0x7B
      * p1: 0x00  
      * p2: 0x00: a is 32 zero bytes
@@ -3495,6 +3504,10 @@ public class Satochip extends javacard.framework.Applet {
             // the second copies of s and m, and computes P and e again.
             Util.arrayCopyNonAtomic(ecdsaRam, ECDSA_RAM_T, ecdsaRam, ECDSA_RAM_S2, (short)32);
             schnorrVerify(buffer);
+            // T and S2 are two copies of the one s that was computed: this comparison catches
+            // a copy altered while the verification ran (the s that was verified must be the s
+            // that is output). It is not a second check of the arithmetic of s: that is what
+            // the verification itself is.
             if (!arrayCompareConstantTime(ecdsaRam, ECDSA_RAM_T, ecdsaRam, ECDSA_RAM_S2, (short)32))
                 ISOException.throwIt(SW_ECDSA_VERIFY_FAILED);
             // the verdict does not rest on that one branch: compare again here, and output the
