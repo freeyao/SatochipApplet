@@ -2991,12 +2991,20 @@ public class Satochip extends javacard.framework.Applet {
      * (65 bytes at buffer[ECDSA_APDU_R]): BIP340 needs x(R) itself and the parity of y(R).
      */
     private void ecdsaComputeRPoint(byte[] buffer) {
-        // Q = w*G
         randomScalar(recvBuffer, ECDSA_OFFSET_X);
+        // w is read three times: for Q, for w^-1 and for the check of k' below. The copy that
+        // is inverted is taken before Q is computed, so that the w of Q is read between the
+        // two others. If w is altered at any time, either all three readings see the new value
+        // (a consistent computation with another w), or w^-1 and the w of the check differ and
+        // the check fails. Taken after Q, the copy let a w altered in between give a consistent
+        // w^-1 and check for a Q computed from the old w: a point R that is not k*G. The
+        // signatures catch such an R in their verification; the MuSig2 nonce generation
+        // publishes R and has no verification after it.
+        Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_X, ecdsaRam, (short)(ECDSA_RAM_INV+32), (short)32);
+        // Q = w*G
         setEphemeralScalar(recvBuffer, ECDSA_OFFSET_X);
         getPublicKey(ephemeral_privkey, buffer, ECDSA_APDU_Q);
         // w^-1
-        Util.arrayCopyNonAtomic(recvBuffer, ECDSA_OFFSET_X, ecdsaRam, (short)(ECDSA_RAM_INV+32), (short)32);
         invertModOrder();
         // k' = k * w^-1 mod n, with k blinded. k' is not 0: neither factor is.
         mulModOrder(ecdsaRam, (short)(ECDSA_RAM_INV+32), recvBuffer, ECDSA_OFFSET_K);
