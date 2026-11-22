@@ -345,6 +345,37 @@ public class EcdsaExposedAppletTest {
       assertArrayEquals(new byte[slotSize], Arrays.copyOfRange(slots, slot, slot + slotSize), "the slot is erased all the same");
     }
 
+    // a slot whose k2 is zero (written in part, then an id restored) gives no partial signature
+    {
+      APDUResponse init = cmd.sendRawSecure(SatochipTest.INS_MUSIG2_GENERATE_NONCE, 0xFF, SatochipTest.OP_INIT,
+          new byte[]{0x00, (byte) 0xFF, 0x00});
+      assertEquals(SatochipTest.SW_OK, init.getSw());
+      byte[] id = Arrays.copyOfRange(init.getData(), 66, 68);
+      int slot = (id[1] & (constant("MUSIG2_NB_SLOTS") - 1)) * slotSize;
+      Arrays.fill(slots, slot + 99, slot + 163, (byte) 0);
+      assertEquals(0x9C4C, cmd.sendRawSecure(SatochipTest.INS_MUSIG2_SIGN_HASH, 0xFF,
+          SatochipTest.OP_FINALIZE, SatochipTest.concat(id, ctx)).getSw(), "k2 = 0");
+      assertArrayEquals(new byte[slotSize], Arrays.copyOfRange(slots, slot, slot + slotSize), "the slot is erased");
+    }
+
+    // the nonce counter is held twice: a copy altered at rest (here set back) is detected, and
+    // the card goes on from the larger copy, so no counter value is used twice
+    {
+      byte[] counter = (byte[]) field(applet, "musig2NonceCounter");
+      assertEquals(16, counter.length);
+      APDUResponse first = cmd.sendRawSecure(SatochipTest.INS_MUSIG2_GENERATE_NONCE, 0xFF, SatochipTest.OP_INIT,
+          new byte[]{0x00, (byte) 0xFF, 0x00});
+      assertEquals(SatochipTest.SW_OK, first.getSw());
+      java.math.BigInteger before = new java.math.BigInteger(1, Arrays.copyOfRange(counter, 8, 16));
+      assertArrayEquals(Arrays.copyOfRange(counter, 0, 8), Arrays.copyOfRange(counter, 8, 16), "both copies equal");
+      counter[7] ^= 0x01; // the first copy, one bit flipped (now one below or one above)
+      assertEquals(SatochipTest.SW_OK, cmd.sendRawSecure(SatochipTest.INS_MUSIG2_GENERATE_NONCE, 0xFF,
+          SatochipTest.OP_INIT, new byte[]{0x00, (byte) 0xFF, 0x00}).getSw());
+      assertArrayEquals(Arrays.copyOfRange(counter, 0, 8), Arrays.copyOfRange(counter, 8, 16), "copies equal again");
+      assertTrue(new java.math.BigInteger(1, Arrays.copyOfRange(counter, 8, 16)).compareTo(before) > 0,
+          "the counter went on from the larger copy");
+    }
+
     // and through the commands, on these backends
     SatochipTest.checkMusig2PartialSignatures(cmd);
   }

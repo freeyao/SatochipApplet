@@ -466,6 +466,13 @@ public class Satochip extends javacard.framework.Applet {
      * NonceGen with a counter in extra_in). Either one not repeating is enough for the nonces
      * not to repeat. Persistent, incremented before each use, never reset: not when the seed
      * is reset, as an imported key can outlive it.
+     *
+     * The platform is not trusted to provide randomness that does not repeat, so the counter is
+     * what keeps two nonces apart, and it must survive one altered bit: it is held twice
+     * (bytes 0..8 and 8..16, big-endian), both copies are incremented and compared before use,
+     * and the copy that goes into the hash is compared with the second one after both hashes
+     * are computed (see musig2NonceGen()). If the two persistent copies differ, one of them was
+     * altered at rest: the card goes on from the larger one, which is beyond every value used.
      */
     private byte[] musig2NonceCounter;
     private static final short MUSIG2_COUNTER_SIZE = (short)8;
@@ -690,7 +697,7 @@ public class Satochip extends javacard.framework.Applet {
 
         // MuSig2: secnonce slots and nonce counter (persistent)
         musig2Slots = new byte[(short)(MUSIG2_NB_SLOTS * MUSIG2_SLOT_SIZE)];
-        musig2NonceCounter = new byte[MUSIG2_COUNTER_SIZE];
+        musig2NonceCounter = new byte[(short)(2*MUSIG2_COUNTER_SIZE)];
 
         // card label
         card_label = new byte[MAX_CARD_LABEL_SIZE];  
@@ -1624,7 +1631,7 @@ public class Satochip extends javacard.framework.Applet {
             Util.arrayFillNonAtomic(trusted_pubkey, (short) 0, PUBKEY_SIZE, (byte) 0x00);
         }
         
-        // reset MuSig2 state: invalidate all exported encrypted secnonces and reset nonce ids
+        // MuSig2: erase the pending secnonces (the id and nonce counters are kept)
         resetMusig2NonceState();
         
         return true;
@@ -3657,7 +3664,7 @@ public class Satochip extends javacard.framework.Applet {
      * p2: OP_INIT (0x01). Anything else is rejected with SW_INCORRECT_P2: up to protocol 0.19
      *     OP_FINALIZE returned the encrypted secnonce, which no longer exists.
      * data: [aggpk_size(1b) | aggpk | msg_size (1b) | msg | extra_size(1b) | extra_bytes]
-     *       aggpk_size: 0 or 32; msg_size: 0..32, or 0xFF for "no message"; extra_size: 0..32
+     *       aggpk_size: 0 or 32; msg_size: 0..32, or 0xFF for "no message" (other values are refused); extra_size: 0..32
      *
      * return: [pubnonce(66b) | id(2b)]
      */
@@ -3748,12 +3755,12 @@ public class Satochip extends javacard.framework.Applet {
                 ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
             byte m_size = buffer[buffer_offset++];
             bytesLeft--;
-            if (m_size<0x00) {
+            if (m_size == (byte)0xFF) {
                 // 0xff is interpreted as "no message provided", which is not the same as a message of size 0
                 recvBuffer[recvOffset++] = 0x00;
             } else {
-                // note: we suppose message is max 32 bytes...
-                if (m_size>32)
+                // note: we suppose message is max 32 bytes... (0x80..0xFE are refused too)
+                if (m_size<0 || m_size>32)
                     ISOException.throwIt(SW_INVALID_PARAMETER);
                 if (bytesLeft<m_size)
                     ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
@@ -3782,16 +3789,27 @@ public class Satochip extends javacard.framework.Applet {
             recvBuffer[recvOffset++] = (byte)(extra_size + (cardCounter ? MUSIG2_COUNTER_SIZE : (short)0)); // 4-byte length
             Util.arrayCopyNonAtomic(buffer, buffer_offset, recvBuffer, recvOffset, (short)extra_size);
             recvOffset+=extra_size;
+            short counterOff = (short)-1;
             if (cardCounter) {
-                // a counter value is never handed out twice: it is incremented, atomically,
-                // before it is used
+                // a counter value is never handed out twice: both copies are incremented,
+                // atomically, before it is used, and must then be equal
                 JCSystem.beginTransaction();
-                for (i = (short)(MUSIG2_COUNTER_SIZE-1); i >= (short)0; i--) {
-                    musig2NonceCounter[i]++;
-                    if (musig2NonceCounter[i] != (byte)0)
-                        break;
-                }
+                musig2IncrementCounter((short)0);
+                musig2IncrementCounter(MUSIG2_COUNTER_SIZE);
                 JCSystem.commitTransaction();
+                if (Util.arrayCompare(musig2NonceCounter, (short)0, musig2NonceCounter, MUSIG2_COUNTER_SIZE, MUSIG2_COUNTER_SIZE) != (byte)0) {
+                    // one copy was altered at rest. The larger one, incremented, is beyond every
+                    // value used so far (used values never exceed the unaltered copy): go on from it.
+                    JCSystem.beginTransaction();
+                    if (Biginteger.lessThan(musig2NonceCounter, (short)0, musig2NonceCounter, MUSIG2_COUNTER_SIZE, MUSIG2_COUNTER_SIZE))
+                        Util.arrayCopy(musig2NonceCounter, MUSIG2_COUNTER_SIZE, musig2NonceCounter, (short)0, MUSIG2_COUNTER_SIZE);
+                    else
+                        Util.arrayCopy(musig2NonceCounter, (short)0, musig2NonceCounter, MUSIG2_COUNTER_SIZE, MUSIG2_COUNTER_SIZE);
+                    JCSystem.commitTransaction();
+                    if (Util.arrayCompare(musig2NonceCounter, (short)0, musig2NonceCounter, MUSIG2_COUNTER_SIZE, MUSIG2_COUNTER_SIZE) != (byte)0)
+                        ISOException.throwIt(SW_INTERNAL_ERROR);
+                }
+                counterOff = recvOffset;
                 Util.arrayCopyNonAtomic(musig2NonceCounter, (short)0, recvBuffer, recvOffset, MUSIG2_COUNTER_SIZE);
                 recvOffset+=MUSIG2_COUNTER_SIZE;
             }
@@ -3804,6 +3822,12 @@ public class Satochip extends javacard.framework.Applet {
                 musig2NonceHash(msgSize, (short)(MUSIG2_RAM_K + 64*i));
                 musig2NonceHash(msgSize, (short)(MUSIG2_RAM_K + 64*i + 32));
             }
+            // the counter both hashes read must be the counter that was stored: a copy altered
+            // before both hashes would give two equal hashes of a counter value that may have
+            // been used before
+            if (counterOff >= (short)0
+                    && Util.arrayCompare(recvBuffer, counterOff, musig2NonceCounter, MUSIG2_COUNTER_SIZE, MUSIG2_COUNTER_SIZE) != (byte)0)
+                ISOException.throwIt(SW_ECDSA_VERIFY_FAILED);
             // the hashed message held rand; pk stays where it is, for the slot
             Util.arrayFillNonAtomic(recvBuffer, OFFSET_BIP327_RAND, (short)33, (byte)0);
             Util.arrayFillNonAtomic(recvBuffer, (short)(OFFSET_BIP327_PK+33), (short)(recvOffset+1-OFFSET_BIP327_PK-33), (byte)0);
@@ -3854,6 +3878,15 @@ public class Satochip extends javacard.framework.Applet {
             clearSigningScratch(buffer, sizeout, ECDSA_APDU_SIZE);
         }
         return sizeout;
+    }
+
+    /** musig2NonceCounter[off..off+8) += 1, big-endian. Call inside a transaction. */
+    private void musig2IncrementCounter(short off) {
+        for (short i = (short)(off+MUSIG2_COUNTER_SIZE-1); i >= off; i--) {
+            musig2NonceCounter[i]++;
+            if (musig2NonceCounter[i] != (byte)0)
+                break;
+        }
     }
 
     /**
@@ -4005,6 +4038,27 @@ public class Satochip extends javacard.framework.Applet {
             Util.arrayCopyNonAtomic(musig2Slots, (short)(slotOff+MUSIG2_SLOT_PK), ecdsaRam, ECDSA_RAM_H2, (short)33);
             Util.setShort(musig2Slots, slotOff, (short)0);
             Util.arrayFillNonAtomic(musig2Slots, (short)(slotOff+MUSIG2_SLOT_PK), (short)(MUSIG2_SLOT_SIZE-MUSIG2_SLOT_PK), (byte)0);
+            // the erasure must have hit the slot of this secnonce: no slot may still hold its
+            // id. The id is read again from the command, and every slot is looked at, so that
+            // an altered offset or id cannot leave the secnonce in place while the command goes
+            // on to sign with it (a second signature with it would give the private key away).
+            // If one still holds it, it is erased and nothing is signed.
+            id = Util.getShort(buffer, OFFSET_BIP327_SIGN_ID);
+            for (short s = (short)0; s < MUSIG2_NB_SLOTS; s++) {
+                short off = (short)(s * MUSIG2_SLOT_SIZE);
+                if (Util.getShort(musig2Slots, off) == id) {
+                    Util.setShort(musig2Slots, off, (short)0);
+                    Util.arrayFillNonAtomic(musig2Slots, (short)(off+MUSIG2_SLOT_PK), (short)(MUSIG2_SLOT_SIZE-MUSIG2_SLOT_PK), (byte)0);
+                    ISOException.throwIt(SW_INTERNAL_ERROR);
+                }
+            }
+            // a nonce is never 0 nor >= n (musig2NonceGen() refuses them). A slot that was
+            // written only in part (power lost, then an id restored) can hold zeros.
+            if (Biginteger.isZeroCT(ecdsaRam, MUSIG2_RAM_K, (short)32)
+                    | !Biginteger.lessThanCT(ecdsaRam, MUSIG2_RAM_K, Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32)
+                    | Biginteger.isZeroCT(ecdsaRam, (short)(MUSIG2_RAM_K+64), (short)32)
+                    | !Biginteger.lessThanCT(ecdsaRam, (short)(MUSIG2_RAM_K+64), Secp256k1.SECP256K1, Secp256k1.OFFSET_SECP256K1_R, (short)32))
+                ISOException.throwIt(SW_SCHNORR_INVALID_NONCE);
 
             // the secnonce belongs to one key: check that it is this one
             getPublicKey(privkey, recvBuffer, ECDSA_OFFSET_ACC); // uncompressed pubkey (65b)

@@ -1334,6 +1334,12 @@ public class SatochipTest {
     assertEquals(SW_INVALID_PARAMETER, cmdSet.sendRawSecure(INS_MUSIG2_SIGN_HASH, 0xFF, OP_FINALIZE,
         concat(id, sha256("b".getBytes()), new byte[32], flags)).getSw(), "e*a = 0");
 
+    // a message length byte other than 0..32 or 0xFF ("no message") is refused
+    for (int len : new int[]{0x21, 0x80, 0xFE}) {
+      assertEquals(SW_INVALID_PARAMETER, cmdSet.sendRawSecure(INS_MUSIG2_GENERATE_NONCE, 0xFF, OP_INIT,
+          new byte[]{0x00, (byte) len, 0x00}).getSw(), "message length byte 0x" + Integer.toHexString(len));
+    }
+
     // the secnonce is bound to the key it was generated for
     cmdSet.cardBip32GetExtendedKeyRaw("m/86'/0'/0'/0/2");
     assertEquals(SW_BIP327_PUBKEY_MISMATCH,
